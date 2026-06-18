@@ -1,0 +1,15 @@
+{
+  "listen_addr": ":8080",
+  "max_history": 50,
+  "speaker_lock_timeout_ms": 2000,
+  "speaker_cooldown_ms": 2000,
+  "heartbeat_interval_seconds": 30,
+  "reconnect_interval_seconds": 5,
+  "storage_type": "sqlite",
+  "storage_path": "data/coordinator.db",
+  "redis_enabled": true,
+  "redis_host": "localhost",
+  "redis_port": 6379,
+  "redis_password": "",
+  "redis_db": 0
+}

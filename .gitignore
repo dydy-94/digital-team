@@ -1,0 +1,49 @@
+# 二进制文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+*.bin
+
+# 日志文件
+*.log
+logs/
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 配置文件（包含敏感信息）
+config.json
+config_*.json
+
+# 进程 ID 文件
+*.pid
+.http_pids
+
+# 测试文件
+test-*.db
+test-*.go
+test-*.js
+
+# 依赖目录
+node_modules/
+vendor/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多智能体群聊测试</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- ========== 登录页面 ========== -->
+    <div class="login-page" id="login-page">
+        <div class="login-container">
+            <h1>🚀 多智能体群聊系统</h1>
+            <div class="login-box">
+                <h2 id="login-title">登录</h2>
+                <div class="login-form" id="login-form">
+                    <input type="text" id="username-input" placeholder="用户名">
+                    <input type="password" id="password-input" placeholder="密码">
+                </div>
+                <div class="register-form" id="register-form" style="display: none;">
+                    <input type="text" id="reg-username-input" placeholder="用户名">
+                    <input type="password" id="reg-password-input" placeholder="密码">
+                    <input type="text" id="nickname-input" placeholder="昵称（可选）">
+                </div>
+                <div class="login-error" id="login-error"></div>
+                <div class="login-buttons">
+                    <button id="login-btn" class="btn btn-primary">登录</button>
+                    <button id="to-register-btn" class="btn btn-secondary">注册账号</button>
+                    <button id="to-login-btn" class="btn btn-secondary" style="display: none;">返回登录</button>
+                    <button id="register-btn" class="btn btn-success" style="display: none;">注册</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========== 主页面 ========== -->
+    <div class="main-page" id="main-page" style="display: none;">
+        <div class="container">
+            <div class="header-bar">
+                <h1>🚀 多智能体群聊系统</h1>
+                <div class="user-info">
+                    <span>欢迎，<strong id="user-nickname"></strong></span>
+                    <button id="logout-btn" class="btn btn-small">退出</button>
+                </div>
+            </div>
+
+            <div class="room-panel">
+                <h2>聊天室管理</h2>
+                <div class="room-controls">
+                    <input type="text" id="room-name-input" placeholder="聊天室名称">
+                    <div id="room-agents-checkboxes">
+                        <!-- 动态填充已启动的Agent的checkbox -->
+                    </div>
+                    <button id="create-room-btn" class="btn btn-primary" disabled>创建聊天室</button>
+                </div>
+                <div id="rooms-list">
+                    <!-- 聊天室列表将动态生成 -->
+                </div>
+                <div class="room-actions" id="room-actions" style="display: none;">
+                    <button id="leave-room-btn" class="btn btn-warning">退出聊天室</button>
+                </div>
+            </div>
+
+            <!-- 聊天区域：包含消息和成员列表 -->
+            <div class="chat-area" id="chat-area" style="display: none;">
+                <div class="chat-main">
+                    <div class="chat-panel">
+                        <h2>群聊消息</h2>
+                        <div id="message-list"></div>
+                        <div class="input-row">
+                            <select id="sender-mode">
+                                <option value="human">Human (人类)</option>
+                                <option value="agent">Agent (智能体)</option>
+                            </select>
+                            <select id="agent-sender" style="display: none;">
+                                <!-- 动态填充当前聊天室中的Agent -->
+                            </select>
+                            <input type="text" id="message-input" placeholder="输入消息，可通过 @agent_id 提及特定Agent">
+                            <button id="send-btn" class="btn btn-primary" disabled>发送</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="members-panel">
+                    <div class="members-tabs">
+                        <button class="tab-btn active" data-tab="agents">Agent</button>
+                        <button class="tab-btn" data-tab="humans">Human</button>
+                    </div>
+                    <div class="members-content">
+                        <div class="tab-content active" id="agents-list">
+                            <!-- Agent 列表将动态生成 -->
+                        </div>
+                        <div class="tab-content" id="humans-list">
+                            <!-- Human 列表将动态生成 -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========== 右下角配置抽屉 ========== -->
+    <div class="config-drawer-overlay" id="config-overlay" style="display: none;"></div>
+    <div class="config-drawer" id="config-drawer">
+        <div class="drawer-header">
+            <h2>后台环境配置</h2>
+            <button class="drawer-close" id="close-drawer">&times;</button>
+        </div>
+        <div class="drawer-content">
+            <!-- 服务控制 -->
+            <div class="drawer-section">
+                <h3>服务控制</h3>
+                <div class="service-card">
+                    <div class="service-label">协调器</div>
+                    <div class="service-buttons">
+                        <button id="drawer-start-coordinator" class="btn btn-primary btn-sm">启动</button>
+                        <button id="drawer-stop-coordinator" class="btn btn-danger btn-sm" disabled>停止</button>
+                    </div>
+                    <div class="status" id="drawer-coordinator-status">未运行</div>
+                </div>
+                <div class="service-card">
+                    <div class="service-label">Agent</div>
+                    <select id="drawer-agent-count" class="select-sm">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3" selected>3</option>
+                    </select>
+                    <div class="service-buttons">
+                        <button id="drawer-start-agents" class="btn btn-primary btn-sm" disabled>启动</button>
+                        <button id="drawer-stop-agents" class="btn btn-danger btn-sm" disabled>停止</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 系统日志 -->
+            <div class="drawer-section logs-section">
+                <h3>系统日志</h3>
+                <div id="log-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 右下角配置按钮 -->
+    <button class="config-toggle-btn" id="config-toggle">
+        <span class="config-icon">⚙️</span>
+        <span>配置</span>
+    </button>
+
+    <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "agent_id": "agent_1",
+  "coordinator_url": "http://localhost:8080",
+  "agentcore_url": "http://localhost:8000",
+  "listen_addr": ":8001",
+  "endpoint": "http://localhost:8001",
+  "poll_interval": 5,
+  "poll_batch_size": 50,
+  "heartbeat_interval": 30,
+  "max_memory_size": 50,
+  "max_memory_chars": 2000
+}
