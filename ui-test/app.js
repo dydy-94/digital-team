@@ -31,12 +31,14 @@ class AgentTest {
         this.startMemberStatusPolling();
     }
     
-    // 启动成员状态定时检测
+    // 启动成员状态定时检测（改为手动触发，不自动轮询）
+    // 成员状态通过 WebSocket 消息推送来更新，只有收到其他人的消息时才检查
+    // 如果需要强制刷新，可以调用 checkMemberStatus()
     startMemberStatusPolling() {
-        // 每10秒检测一次成员在线状态
-        this.memberStatusTimer = setInterval(() => {
-            this.checkMemberStatus();
-        }, 10000);
+        // 不再自动轮询，交由 WebSocket 消息触发
+        // this.memberStatusTimer = setInterval(() => {
+        //     this.checkMemberStatus();
+        // }, 10000);
     }
     
     // 停止成员状态检测
@@ -647,8 +649,8 @@ class AgentTest {
             // 用户加入聊天室
             if (this.currentChannelId) {
                 this.sendJoin();
-                setTimeout(() => this.checkMemberStatus(), 500);
             }
+            // 注意：不在这里调用 checkMemberStatus，由 joinRoom 统一调用
         };
         
         this.ws.onmessage = (event) => {
@@ -664,14 +666,14 @@ class AgentTest {
             if (event && event.target && event.target.readyState === 3) {
                 errorMsg = '连接已关闭';
             }
-            this.log('error', 'WebSocket 错误: ' + errorMsg);
+            this.log('error', 'WebSocket 连接错误: ' + errorMsg);
         };
         
-        this.ws.onclose = () => {
+        this.ws.onclose = (event) => {
             this.log('info', 'WebSocket 连接关闭');
             this.ws = null;
-            // 不立即调用 leave 接口，因为可能是连接中断或切换聊天室导致的
-            // 用户离线状态由后端通过心跳超时检测
+            // 如果是因 ws_established 冲突导致的关闭，清除 session_id
+            // 前端离线状态由后端通过心跳超时检测
         };
     }
 
@@ -726,6 +728,13 @@ class AgentTest {
             this.log('info', '正在发送消息中，忽略重复调用');
             return;
         }
+
+        // 检查是否已成功加入聊天室（必须有 session_id）
+        if (!this.currentSessionId || !this.currentChannelId) {
+            this.log('warn', '请先加入聊天室');
+            return;
+        }
+
         this.isSending = true;
 
         this.log('info', 'sendMessage called, ws state:', this.ws ? this.ws.readyState : 'null');
@@ -810,12 +819,8 @@ class AgentTest {
     }
     
     handleMessage(data) {
-        // 当收到任何消息时，触发成员状态检测
-        // 这可以确保 Agent 重连后状态能及时更新
-        if (this.currentChannelId) {
-            setTimeout(() => this.checkMemberStatus(), 100);
-        }
-
+        // 只处理消息，不主动查询成员状态
+        // 成员状态由后端通过 WebSocket 定期推送（member_status 类型）
         if (data.type === 'message') {
             const msg = data.data;
             if (msg.channelId === this.currentChannelId) {
@@ -826,12 +831,52 @@ class AgentTest {
                 }
                 this.addMessage(msg.sender, msg.contentText);
             }
+        } else if (data.type === 'member_status') {
+            // 后端主动推送的成员在线状态
+            const msg = data.data;
+            if (msg.room_id === this.currentChannelId || msg.roomId === this.currentChannelId) {
+                // 更新成员状态
+                const members = msg.members || [];
+                const normalizedMembers = members.map(member => ({
+                    agentId: member.member_id,
+                    memberId: member.member_id,
+                    memberType: member.member_type,
+                    member_type: member.member_type,
+                    online: member.member_type === 'agent' ? (member.agent_status === 'ONLINE') : member.is_active,
+                    is_active: member.is_active,
+                    agent_status: member.agent_status,
+                }));
+
+                // 更新缓存
+                this.roomMembers[msg.room_id || msg.roomId] = normalizedMembers;
+                this.memberStatus[msg.room_id || msg.roomId] = {};
+                normalizedMembers.forEach(member => {
+                    this.memberStatus[msg.room_id || msg.roomId][member.agentId] = {
+                        online: member.online
+                    };
+                });
+
+                // 更新当前聊天室成员
+                if (msg.room_id === this.currentChannelId || msg.roomId === this.currentChannelId) {
+                    this.currentMembers = normalizedMembers;
+                    this.renderMembersPanel();
+                }
+
+                // 更新聊天室列表显示
+                this.renderRooms();
+            }
         } else if (data.type === 'warning' || data.type === 'error' || data.type === 'info') {
             // 系统通知消息（warning/error/info）
             const msg = data.data;
             if (msg.roomId === this.currentChannelId || !msg.roomId) {
                 // 作为系统消息展示，警告消息显示为黄色
                 this.addMessage('[系统通知]', msg.content, data.type === 'warning');
+            }
+            // 如果是会话验证失败/无效的 session_id 警告，清除 session_id
+            if (data.type === 'warning' && msg.content && 
+                (msg.content.includes('会话验证失败') || msg.content.includes('无效的 session_id'))) {
+                this.log('warn', '收到会话冲突警告，清除 session_id，请重新加入聊天室');
+                this.currentSessionId = null;
             }
         } else if (data.type === 'stream') {
             // 流式消息更新
@@ -1226,15 +1271,15 @@ class AgentTest {
         }
     }
 
-    // 加入聊天室
+    // 加入聊天室，返回 true/false 表示是否成功
     async joinRoom() {
         if (!this.currentChannelId) {
             this.log('warn', '请先选择一个聊天室');
-            return;
+            return false;
         }
         if (!this.currentUser) {
             this.log('warn', '请先登录');
-            return;
+            return false;
         }
 
         try {
@@ -1255,6 +1300,10 @@ class AgentTest {
                 console.log('[joinRoom] currentSessionId 已保存:', this.currentSessionId);
                 this.log('success', `已加入聊天室: ${this.getCurrentRoomName()}`);
 
+                // join 成功，启用发送按钮
+                const sendBtn = document.getElementById('send-btn');
+                if (sendBtn) sendBtn.disabled = false;
+
                 // 如果 WebSocket 未连接，先连接（携带 session_id）
                 if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
                     console.log('[joinRoom] 准备建立 WS 连接，currentSessionId:', this.currentSessionId);
@@ -1264,11 +1313,24 @@ class AgentTest {
                 // 等待一小段时间后获取成员状态
                 await new Promise(resolve => setTimeout(resolve, 500));
                 await this.checkMemberStatus();
+
+                return true;
             } else {
                 this.log('error', '加入聊天室失败: ' + (data.error || data.message));
+                // join 失败，禁用发送按钮
+                const sendBtn = document.getElementById('send-btn');
+                if (sendBtn) sendBtn.disabled = true;
+                // 清除 session_id
+                this.currentSessionId = null;
+                return false;
             }
         } catch (err) {
             this.log('error', '加入聊天室时出错: ' + err.message);
+            // 出错也要禁用发送按钮
+            const sendBtn = document.getElementById('send-btn');
+            if (sendBtn) sendBtn.disabled = true;
+            this.currentSessionId = null;
+            return false;
         }
     }
 
@@ -1292,7 +1354,7 @@ class AgentTest {
             this.log('success', 'WebSocket 连接成功');
             // 用户加入聊天室
             this.sendJoin();
-            setTimeout(() => this.checkMemberStatus(), 500);
+            // 注意：不在这里调用 checkMemberStatus，由 joinRoom 统一调用
         };
         
         this.ws.onmessage = (event) => {
@@ -1383,45 +1445,26 @@ class AgentTest {
                     created_by: room.created_by
                 }));
 
-                // 为每个房间获取详细信息（包括在线用户和历史消息）
-                this.rooms = await Promise.all(normalizedRooms.map(async room => {
-                    try {
-                        const detailsRes = await fetch(`/api/room/members?room_id=${encodeURIComponent(room.room_id)}`);
-                        const detailsData = await detailsRes.json();
-
-                        if (detailsData.success) {
-                            // 将成员数据也做字段映射
-                            // Agent 在线状态由 agents 表的 status 字段决定，user 由 members 表的 is_active 决定
-                            const members = (detailsData.members || []).map(m => ({
-                                agentId: m.member_id,  // 后端 member_id -> 前端 agentId
-                                member_id: m.member_id,
-                                memberType: m.member_type,  // 后端 member_type -> 前端 memberType
-                                member_type: m.member_type,
-                                online: m.member_type === 'agent' ? (m.agent_status === 'ONLINE') : m.is_active,
-                                is_active: m.is_active,
-                                agent_status: m.agent_status,
-                                joinedAt: m.joined_at
-                            }));
-
-                            return {
-                                ...room,
-                                agents: detailsData.agents || members.filter(m => m.memberType === 'agent').map(m => m.agentId),
-                                members: members,
-                                messages: [],
-                                onlineUsers: members.filter(m => m.memberType === 'user').map(m => m.agentId)
-                            };
-                        }
-                    } catch (err) {
-                        this.log('warn', `获取聊天室 ${room.name} 详情失败: ${err.message}`);
-                    }
-
-                    return room;
+                // 简单处理，只保存基本信息的聊天室列表
+                // 不再为每个聊天室调用 members 接口（用户加入时再获取成员状态）
+                const simplifiedRooms = normalizedRooms.map(room => ({
+                    id: room.room_id,
+                    room_id: room.room_id,
+                    name: room.name,
+                    created: room.created_at,
+                    description: room.description,
+                    created_by: room.created_by
                 }));
+
+                this.rooms = simplifiedRooms;
 
                 this.renderRooms();
 
-                // 加载所有聊天室的成员状态
-                await this.loadAllRoomMembers();
+                // 只对当前聊天室获取一次成员状态（加入时再获取完整状态）
+                // 不再对所有聊天室都查询 members 接口
+                // if (this.currentChannelId) {
+                //     await this.checkMemberStatus(this.currentChannelId);
+                // }
 
                 // 如果当前有聊天室，更新currentRoomAgents
                 if (this.currentChannelId) {
@@ -1579,16 +1622,25 @@ class AgentTest {
             this.log('warn', '请先登录才能加入聊天室');
             const sendBtn3 = document.getElementById('send-btn');
             if (sendBtn3) sendBtn3.disabled = true;
-        } else {
-            // 用户已登录，自动加入聊天室
-            await this.joinRoom();
+            return;
+        }
+
+        // 用户已登录，自动加入聊天室
+        const joinResult = await this.joinRoom();
+
+        // 如果 join 失败，不继续加载历史和成员状态
+        if (!joinResult) {
+            this.log('warn', '无法加入聊天室，无法加载历史记录');
+            // 禁用发送按钮
+            const sendBtn4 = document.getElementById('send-btn');
+            if (sendBtn4) sendBtn4.disabled = true;
+            return;
         }
 
         // 通过 REST API 获取历史消息
         await this.loadHistory();
 
-        // 立即检测成员在线状态
-        await this.checkMemberStatus();
+        // 注意：成员状态检查已在 joinRoom 中调用，这里不再重复调用
 
         this.log('info', `已切换到聊天室: ${room.name}`);
     }

@@ -693,13 +693,21 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 		log.Printf("[DEBUG] WS 未携带 session_id: userID=%s, roomID=%s, sessionIDStr=%s", userID, roomID, sessionIDStr)
 	}
 
-	// 从数据库加载用户已订阅的房间列表（用于恢复之前的订阅）
+	// 从数据库加载用户已订阅的房间列表（仅恢复 ws_established=TRUE 的订阅）
+	// 未携带 session_id 时，需要检查 ws_established 状态
 	sessions, err := h.storage.GetUserRoomSessions(userID)
 	if err == nil && len(sessions) > 0 {
+		validCount := 0
 		for _, session := range sessions {
-			userConn.Rooms[session.RoomID] = true
+			// 只有 ws_established=TRUE 的会话才能恢复订阅
+			if session.WsEstablished {
+				userConn.Rooms[session.RoomID] = true
+				validCount++
+			}
 		}
-		log.Printf("[INFO] 从数据库恢复 %d 个房间订阅: userID=%s", len(sessions), userID)
+		if validCount > 0 {
+			log.Printf("[INFO] 从数据库恢复 %d 个有效房间订阅(ws_established=TRUE): userID=%s", validCount, userID)
+		}
 	}
 
 	// 注册连接（按 connectionID 索引，支持多 Tab）
@@ -1094,8 +1102,11 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, message string) 
 func (h *Handler) notificationPump(conn *UserConn) {
 	// log.Printf("[DEBUG] 启动消息投递轮询: userID=%s", conn.UserID)
 
-	pollInterval := 500 * time.Millisecond // 轮询间隔 500ms
+	pollInterval := 500 * time.Millisecond   // 消息轮询间隔 500ms
+	memberStatusInterval := 30 * time.Second // 成员状态推送间隔 30 秒
 	lastPolled := time.Now()
+	lastMemberStatusUpdate := time.Now()
+	pollCounter := 0
 
 	for {
 		select {
@@ -1160,7 +1171,65 @@ func (h *Handler) notificationPump(conn *UserConn) {
 
 				lastPolled = time.Now()
 			}
+
+			// 定期推送成员在线状态（不存入 messages 表）
+			pollCounter++
+			if time.Since(lastMemberStatusUpdate) >= memberStatusInterval {
+				lastMemberStatusUpdate = time.Now()
+				// 获取该连接订阅的所有聊天室
+				conn.RoomsMu.RLock()
+				rooms := make([]string, 0, len(conn.Rooms))
+				for roomID := range conn.Rooms {
+					rooms = append(rooms, roomID)
+				}
+				conn.RoomsMu.RUnlock()
+
+				// 为每个聊天室推送成员状态
+				for _, roomID := range rooms {
+					h.pushMemberStatus(conn, roomID)
+				}
+			}
 		}
+	}
+}
+
+// pushMemberStatus 推送聊天室成员在线状态（通过 WebSocket，不存入 messages 表）
+func (h *Handler) pushMemberStatus(conn *UserConn, roomID string) {
+	// 获取聊天室成员列表（包含 agent_status）
+	members, err := h.storage.GetRoomMembers(roomID)
+	if err != nil {
+		log.Printf("[WARN] 获取成员列表失败: roomID=%s, err=%v", roomID, err)
+		return
+	}
+
+	// 构造成员状态消息
+	memberList := make([]map[string]interface{}, 0, len(members))
+	for _, m := range members {
+		memberList = append(memberList, map[string]interface{}{
+			"member_id":    m.MemberID,
+			"member_type":  m.MemberType,
+			"agent_status": m.AgentStatus,
+			"is_active":    m.IsActive,
+			"joined_at":    m.JoinedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+	}
+
+	wsMsg := map[string]interface{}{
+		"type": "member_status",
+		"data": map[string]interface{}{
+			"room_id": roomID,
+			"members": memberList,
+		},
+	}
+
+	data, _ := json.Marshal(wsMsg)
+
+	// 发送到 WebSocket
+	select {
+	case conn.Send <- data:
+		// log.Printf("[DEBUG] 已推送成员状态: roomID=%s, members=%d", roomID, len(members))
+	default:
+		// log.Printf("[WARN] 成员状态推送失败，缓冲区满: roomID=%s", roomID)
 	}
 }
 
