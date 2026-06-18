@@ -33,6 +33,9 @@ type Member struct {
 	JoinedAt   time.Time  `json:"joined_at" db:"joined_at"`
 	LeftAt     *time.Time `json:"left_at,omitempty" db:"left_at"`
 	IsActive   bool       `json:"is_active" db:"is_active"`
+	// Agent 在线状态（仅对 agent 类型成员有效，user 类型为空）
+	// 由 agents 表的 status 字段决定，反映 x-client 的心跳状态
+	AgentStatus string `json:"agent_status,omitempty" db:"agent_status"`
 }
 
 // User 平台用户
@@ -50,33 +53,21 @@ type User struct {
 
 // Message 消息
 type Message struct {
-	ID            int64     `json:"-" db:"id"`
-	MsgID         string    `json:"msg_id" db:"msg_id"`
-	RoomID        string    `json:"room_id" db:"room_id"`
-	SenderID      string    `json:"sender_id" db:"sender_id"`
-	SenderType    string    `json:"sender_type" db:"sender_type"`     // agent / user / system
-	TargetID      string    `json:"target_id" db:"target_id"`         // ALL / specific_id
-	TargetType    string    `json:"target_type" db:"target_type"`     // BROADCAST / DIRECT
-	MentionUsers  string    `json:"mention_users" db:"mention_users"` // JSON array
-	Content       string    `json:"content" db:"content"`
-	Intent        string    `json:"intent" db:"intent"` // INFORM / REQUEST / RESPONSE / SYSTEM
-	Status        string    `json:"status" db:"status"` // PENDING / DELIVERED / READ
-	ReplyToMsgID  string    `json:"reply_to_msg_id,omitempty" db:"reply_to_msg_id"`
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
-	DeliveredAt   time.Time `json:"delivered_at,omitempty" db:"delivered_at"`
-	ReadAt        time.Time `json:"read_at,omitempty" db:"read_at"`
-	SpeakerLock   string    `json:"-" db:"speaker_lock"`
-	LockExpiresAt time.Time `json:"-" db:"lock_expires_at"`
-}
-
-// SpeakerLock 发言锁
-type SpeakerLock struct {
-	ID         int64     `json:"-" db:"id"`
-	RoomID     string    `json:"room_id" db:"room_id"`
-	HolderID   string    `json:"holder_id" db:"holder_id"`
-	HolderType string    `json:"holder_type" db:"holder_type"`
-	AcquiredAt time.Time `json:"acquired_at" db:"acquired_at"`
-	ExpiresAt  time.Time `json:"expires_at" db:"expires_at"`
+	ID           int64     `json:"-" db:"id"`
+	MsgID        string    `json:"msg_id" db:"msg_id"`
+	RoomID       string    `json:"room_id" db:"room_id"`
+	SenderID     string    `json:"sender_id" db:"sender_id"`
+	SenderType   string    `json:"sender_type" db:"sender_type"`     // agent / user / system
+	TargetID     string    `json:"target_id" db:"target_id"`         // ALL / specific_id
+	TargetType   string    `json:"target_type" db:"target_type"`     // BROADCAST / DIRECT
+	MentionUsers string    `json:"mention_users" db:"mention_users"` // JSON array
+	Content      string    `json:"content" db:"content"`
+	Intent       string    `json:"intent" db:"intent"` // INFORM / REQUEST / RESPONSE / SYSTEM
+	Status       string    `json:"status" db:"status"` // PENDING / DELIVERED / READ
+	ReplyToMsgID string    `json:"reply_to_msg_id,omitempty" db:"reply_to_msg_id"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	DeliveredAt  time.Time `json:"delivered_at,omitempty" db:"delivered_at"`
+	ReadAt       time.Time `json:"read_at,omitempty" db:"read_at"`
 }
 
 // MessageDelivery 消息投递记录

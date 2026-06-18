@@ -198,23 +198,6 @@ func (h *Handler) SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	// 生成消息 ID
 	msgID := uuid.New().String()
 
-	// 尝试获取发言锁（非 @ 消息且非 agent 发送需要锁）
-	// Agent 发送消息不需要发言锁，因为它们是被 @ 后必须回复的
-	needsLock := len(req.MentionUsers) == 0 && req.SenderType != "agent"
-	if needsLock {
-		acquired, err := h.storage.TryAcquireLock(req.RoomID, req.SenderID, req.SenderType)
-		if err != nil || !acquired {
-			currentSpeaker, _ := h.storage.GetCurrentSpeaker(req.RoomID)
-			h.writeError(w, http.StatusConflict, fmt.Sprintf("当前发言者: %s，请稍后重试", currentSpeaker))
-			return
-		}
-		// 延迟释放锁
-		go func() {
-			time.Sleep(time.Duration(h.cfg.SpeakerLockTimeout) * time.Millisecond)
-			h.storage.ReleaseLock(req.RoomID, req.SenderID)
-		}()
-	}
-
 	// 构建消息
 	intent := req.Intent
 	if intent == "" {
@@ -740,8 +723,16 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 
 func (h *Handler) userReadPump(conn *UserConn) {
 	defer func() {
-		// 只关闭 WebSocket 连接，channel 关闭操作在 handleWebSocket 函数中统一处理
+		// 关闭 WebSocket 连接
 		conn.Conn.Close()
+
+		// 立即更新数据库：将 ws_established 设为 FALSE
+		if err := h.storage.UpdateUserRoomSessionWsEstablished(conn.ConnectionID, false); err != nil {
+			log.Printf("[WARN] 更新 ws_established 失败: connectionID=%s, err=%v", conn.ConnectionID, err)
+		} else {
+			log.Printf("[INFO] WebSocket 断开，已更新 ws_established=FALSE: connectionID=%s, userID=%s",
+				conn.ConnectionID, conn.UserID)
+		}
 	}()
 
 	for {
@@ -928,22 +919,6 @@ func (h *Handler) handleSpeakMessage(conn *UserConn, data map[string]interface{}
 		msgID = uuid.New().String()
 	}
 
-	// 尝试获取发言锁（非 @ 消息需要锁）
-	if len(mentionUsers) == 0 {
-		acquired, err := h.storage.TryAcquireLock(roomID, sender, "user")
-		if err != nil || !acquired {
-			currentSpeaker, _ := h.storage.GetCurrentSpeaker(roomID)
-			log.Printf("[WARN] 当前发言者: %s，请稍后重试", currentSpeaker)
-			return
-		}
-		// 延迟释放锁
-		go func() {
-			time.Sleep(time.Duration(h.cfg.SpeakerLockTimeout) * time.Millisecond)
-			h.storage.ReleaseLock(roomID, sender)
-		}()
-	}
-
-	// 构建消息
 	wsMsg := &Message{
 		MsgID:        msgID,
 		RoomID:       roomID,

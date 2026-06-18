@@ -18,10 +18,6 @@ type Storage struct {
 	db  *sql.DB
 	cfg *Config
 
-	// 发言锁（内存 + 数据库双重保证）
-	lockMu   sync.RWMutex
-	speeches map[string]*SpeakerLock // room_id -> lock
-
 	// 聊天室成员缓存（内存加速查询）
 	memberMu sync.RWMutex
 	members  map[string]map[string]*Member // room_id -> member_id -> Member
@@ -43,10 +39,9 @@ func NewStorage(cfg *Config) (*Storage, error) {
 	}
 
 	s := &Storage{
-		db:       db,
-		cfg:      cfg,
-		speeches: make(map[string]*SpeakerLock),
-		members:  make(map[string]map[string]*Member),
+		db:      db,
+		cfg:     cfg,
+		members: make(map[string]map[string]*Member),
 	}
 
 	// 创建用户会话表
@@ -276,11 +271,14 @@ func (s *Storage) RemoveMember(roomID, memberID string) error {
 }
 
 // GetRoomMembers 获取聊天室成员
+// 对于 agent 类型的成员，同时返回 agents 表的在线状态
 func (s *Storage) GetRoomMembers(roomID string) ([]*Member, error) {
 	query := `
-		SELECT id, room_id, member_id, member_type, joined_at, left_at, is_active
-		FROM members
-		WHERE room_id = ? AND is_active = TRUE
+		SELECT m.id, m.room_id, m.member_id, m.member_type, m.joined_at, m.left_at, m.is_active,
+		       a.status AS agent_status
+		FROM members m
+		LEFT JOIN agents a ON m.member_id = a.agent_id AND m.member_type = 'agent'
+		WHERE m.room_id = ? AND m.is_active = TRUE
 	`
 	rows, err := s.db.Query(query, roomID)
 	if err != nil {
@@ -292,11 +290,15 @@ func (s *Storage) GetRoomMembers(roomID string) ([]*Member, error) {
 	for rows.Next() {
 		var m Member
 		var leftAt sql.NullTime
-		if err := rows.Scan(&m.ID, &m.RoomID, &m.MemberID, &m.MemberType, &m.JoinedAt, &leftAt, &m.IsActive); err != nil {
+		var agentStatus sql.NullString
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.MemberID, &m.MemberType, &m.JoinedAt, &leftAt, &m.IsActive, &agentStatus); err != nil {
 			return nil, err
 		}
 		if leftAt.Valid {
 			m.LeftAt = &leftAt.Time
+		}
+		if agentStatus.Valid {
+			m.AgentStatus = agentStatus.String
 		}
 		members = append(members, &m)
 	}
@@ -737,94 +739,6 @@ func (s *Storage) GetRecentMessages(roomID string, limit int) ([]*Message, error
 	return messages, nil
 }
 
-// ============ 发言锁操作 ============
-
-// TryAcquireLock 尝试获取发言锁
-func (s *Storage) TryAcquireLock(roomID, holderID, holderType string) (bool, error) {
-	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-
-	// 检查当前锁状态
-	if lock, exists := s.speeches[roomID]; exists {
-		// 锁未过期，不能获取
-		if time.Now().Before(lock.ExpiresAt) {
-			return false, nil
-		}
-	}
-
-	// 尝试更新数据库中的锁
-	query := `
-		INSERT INTO speaker_locks (room_id, holder_id, holder_type, expires_at)
-		VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MILLISECOND))
-		ON DUPLICATE KEY UPDATE
-			holder_id = VALUES(holder_id),
-			holder_type = VALUES(holder_type),
-			expires_at = VALUES(expires_at)
-	`
-
-	timeout := s.cfg.SpeakerLockTimeout
-	if timeout <= 0 {
-		timeout = 2000
-	}
-
-	result, err := s.db.Exec(query, roomID, holderID, holderType, timeout)
-	if err != nil {
-		return false, err
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		// 锁已存在且未过期
-		return false, nil
-	}
-
-	// 更新内存中的锁
-	s.speeches[roomID] = &SpeakerLock{
-		RoomID:     roomID,
-		HolderID:   holderID,
-		HolderType: holderType,
-		ExpiresAt:  time.Now().Add(time.Duration(timeout) * time.Millisecond),
-	}
-
-	return true, nil
-}
-
-// ReleaseLock 释放发言锁
-func (s *Storage) ReleaseLock(roomID, holderID string) error {
-	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-
-	query := `DELETE FROM speaker_locks WHERE room_id = ? AND holder_id = ?`
-	_, err := s.db.Exec(query, roomID, holderID)
-
-	if err == nil {
-		delete(s.speeches, roomID)
-	}
-
-	return err
-}
-
-// GetCurrentSpeaker 获取当前发言者
-func (s *Storage) GetCurrentSpeaker(roomID string) (string, error) {
-	s.lockMu.RLock()
-	if lock, exists := s.speeches[roomID]; exists {
-		if time.Now().Before(lock.ExpiresAt) {
-			s.lockMu.RUnlock()
-			return lock.HolderID, nil
-		}
-	}
-	s.lockMu.RUnlock()
-
-	// 查数据库
-	query := `SELECT holder_id FROM speaker_locks WHERE room_id = ? AND expires_at > NOW()`
-	var holderID string
-	err := s.db.QueryRow(query, roomID).Scan(&holderID)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	return holderID, err
-}
-
 // ============ 清理任务 ============
 
 // startCleanup 启动定期清理
@@ -833,29 +747,12 @@ func (s *Storage) startCleanup() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// 清理过期的发言锁
-		s.cleanupExpiredLocks()
-
 		// 检查离线 Agent
 		s.CheckOfflineAgents()
 
 		// 清理旧消息
 		s.cleanupOldMessages()
 	}
-}
-
-func (s *Storage) cleanupExpiredLocks() {
-	s.lockMu.Lock()
-	defer s.lockMu.Unlock()
-
-	for roomID, lock := range s.speeches {
-		if time.Now().After(lock.ExpiresAt) {
-			delete(s.speeches, roomID)
-		}
-	}
-
-	query := `DELETE FROM speaker_locks WHERE expires_at < NOW()`
-	s.db.Exec(query)
 }
 
 func (s *Storage) cleanupOldMessages() {

@@ -63,8 +63,10 @@ class AgentTest {
                     memberId: member.member_id,
                     memberType: member.member_type,
                     member_type: member.member_type,
-                    online: member.is_active,
+                    // Agent 在线状态由 agents 表的 status 字段决定，user 由 members 表的 is_active 决定
+                    online: member.member_type === 'agent' ? (member.agent_status === 'ONLINE') : member.is_active,
                     is_active: member.is_active,
+                    agent_status: member.agent_status,
                     joinedAt: member.joined_at
                 }));
 
@@ -1389,13 +1391,15 @@ class AgentTest {
 
                         if (detailsData.success) {
                             // 将成员数据也做字段映射
+                            // Agent 在线状态由 agents 表的 status 字段决定，user 由 members 表的 is_active 决定
                             const members = (detailsData.members || []).map(m => ({
                                 agentId: m.member_id,  // 后端 member_id -> 前端 agentId
                                 member_id: m.member_id,
                                 memberType: m.member_type,  // 后端 member_type -> 前端 memberType
                                 member_type: m.member_type,
-                                online: m.is_active,  // 后端 is_active -> 前端 online
+                                online: m.member_type === 'agent' ? (m.agent_status === 'ONLINE') : m.is_active,
                                 is_active: m.is_active,
+                                agent_status: m.agent_status,
                                 joinedAt: m.joined_at
                             }));
 
