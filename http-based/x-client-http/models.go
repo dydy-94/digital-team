@@ -11,16 +11,16 @@ import (
 
 // PollMessage 从 Coordinator 轮询到的消息
 type PollMessage struct {
-	MsgID         string   `json:"msg_id"`
-	RoomID        string   `json:"room_id"`
-	SenderID      string   `json:"sender_id"`
-	SenderType    string   `json:"sender_type"`
-	Content       string   `json:"content"`
-	MentionUsers  []string `json:"mention_users"`
-	Intent        string   `json:"intent"`
-	ReplyToMsgID  string   `json:"reply_to_msg_id,omitempty"`
-	TargetID      string   `json:"target_id"`
-	CreatedAt     int64    `json:"created_at"`
+	MsgID        string   `json:"msg_id"`
+	RoomID       string   `json:"room_id"`
+	SenderID     string   `json:"sender_id"`
+	SenderType   string   `json:"sender_type"`
+	Content      string   `json:"content"`
+	MentionUsers []string `json:"mention_users"`
+	Intent       string   `json:"intent"`
+	ReplyToMsgID string   `json:"reply_to_msg_id,omitempty"`
+	TargetID     string   `json:"target_id"`
+	CreatedAt    int64    `json:"created_at"`
 }
 
 // PollResponse 轮询响应
@@ -31,14 +31,14 @@ type PollResponse struct {
 
 // SendMessageRequest 发送消息请求
 type SendMessageRequest struct {
-	RoomID        string   `json:"room_id"`
-	SenderID      string   `json:"sender_id"`
-	SenderType    string   `json:"sender_type"`
-	Content       string   `json:"content"`
-	TargetID      string   `json:"target_id"`
-	MentionUsers  []string `json:"mention_users"`
-	Intent        string   `json:"intent"`
-	ReplyToMsgID  string   `json:"reply_to_msg_id"`
+	RoomID       string   `json:"room_id"`
+	SenderID     string   `json:"sender_id"`
+	SenderType   string   `json:"sender_type"`
+	Content      string   `json:"content"`
+	TargetID     string   `json:"target_id"`
+	MentionUsers []string `json:"mention_users"`
+	Intent       string   `json:"intent"`
+	ReplyToMsgID string   `json:"reply_to_msg_id"`
 }
 
 // SendMessageResponse 发送消息响应
@@ -52,6 +52,23 @@ type SendMessageResponse struct {
 type RegisterRequest struct {
 	AgentID  string `json:"agent_id"`
 	Endpoint string `json:"endpoint"`
+}
+
+// AgentSendMessageRequest Agent 主动发送消息请求（通过 x-client 代理）
+type AgentSendMessageRequest struct {
+	RoomID       string   `json:"room_id" binding:"required"`
+	Content      string   `json:"content" binding:"required"`
+	TargetID     string   `json:"target_id"` // 默认 ALL
+	MentionUsers []string `json:"mention_users"`
+	Intent       string   `json:"intent"` // 默认 INFORM
+	ReplyToMsgID string   `json:"reply_to_msg_id"`
+}
+
+// AgentSendMessageResponse Agent 主动发送消息响应
+type AgentSendMessageResponse struct {
+	Success bool   `json:"success"`
+	MsgID   string `json:"msg_id,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // ============ Memory Window ============

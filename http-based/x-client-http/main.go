@@ -21,18 +21,18 @@ import (
 // ============ XClient HTTP 版本 ============
 
 type XClient struct {
-	agentID      string
+	agentID        string
 	coordinatorURL string
-	agentCoreURL string
-	listenAddr   string
-	endpoint     string
-	pollInterval int
+	agentCoreURL   string
+	listenAddr     string
+	endpoint       string
+	pollInterval   int
 
-	memoryWins    map[string]*MemoryWindow
-	sessionMgr    *SessionManager
-	messageIDs    map[string]bool
-	msgIDsMu      sync.Mutex
-	maxMemorySize int
+	memoryWins     map[string]*MemoryWindow
+	sessionMgr     *SessionManager
+	messageIDs     map[string]bool
+	msgIDsMu       sync.Mutex
+	maxMemorySize  int
 	maxMemoryChars int
 
 	httpClient *http.Client
@@ -57,18 +57,18 @@ func NewXClient(cfg *Config) *XClient {
 	}
 
 	return &XClient{
-		agentID:       cfg.AgentID,
+		agentID:        cfg.AgentID,
 		coordinatorURL: cfg.CoordinatorURL,
-		agentCoreURL:  cfg.AgentCoreURL,
-		listenAddr:    cfg.ListenAddr,
-		endpoint:      endpoint,
-		pollInterval:  cfg.PollInterval,
-		memoryWins:    make(map[string]*MemoryWindow),
-		sessionMgr:    NewSessionManager(),
-		messageIDs:    make(map[string]bool),
-		maxMemorySize: cfg.MaxMemorySize,
+		agentCoreURL:   cfg.AgentCoreURL,
+		listenAddr:     cfg.ListenAddr,
+		endpoint:       endpoint,
+		pollInterval:   cfg.PollInterval,
+		memoryWins:     make(map[string]*MemoryWindow),
+		sessionMgr:     NewSessionManager(),
+		messageIDs:     make(map[string]bool),
+		maxMemorySize:  cfg.MaxMemorySize,
 		maxMemoryChars: cfg.MaxMemoryChars,
-		joinedRooms:   make(map[string]bool),
+		joinedRooms:    make(map[string]bool),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -314,19 +314,19 @@ func (x *XClient) wakeupAgentCore(msg *PollMessage, memoryWin *MemoryWindow) {
 
 func (x *XClient) sendReply(originalMsg *PollMessage, content string) {
 	req := SendMessageRequest{
-		RoomID:        originalMsg.RoomID,
-		SenderID:      x.agentID,
-		SenderType:    "agent",
-		Content:       content,
-		TargetID:      "ALL",
-		MentionUsers:  []string{},
-		Intent:        "RESPONSE",
-		ReplyToMsgID:  originalMsg.MsgID,
+		RoomID:       originalMsg.RoomID,
+		SenderID:     x.agentID,
+		SenderType:   "agent",
+		Content:      content,
+		TargetID:     "ALL",
+		MentionUsers: []string{},
+		Intent:       "RESPONSE",
+		ReplyToMsgID: originalMsg.MsgID,
 	}
 	jsonData, _ := json.Marshal(req)
 
 	log.Printf("[DEBUG] [%s] 发送回复请求: %s, URL: %s", x.agentID, string(jsonData), x.coordinatorURL+"/api/message")
-	
+
 	resp, err := x.httpClient.Post(
 		x.coordinatorURL+"/api/message",
 		"application/json",
@@ -375,6 +375,9 @@ func (x *XClient) startHTTPServer() {
 	// 获取状态
 	mux.HandleFunc("/status", x.handleStatus)
 
+	// Agent 主动发送消息接口
+	mux.HandleFunc("/api/send", x.handleAgentSendMessage)
+
 	x.httpServer = &http.Server{
 		Addr:    x.listenAddr,
 		Handler: mux,
@@ -411,11 +414,11 @@ func (x *XClient) handleSkillCallback(w http.ResponseWriter, r *http.Request) {
 	// 处理回调
 	memoryWin := x.getMemoryWindow(req.RoomID)
 	go x.wakeupAgentCore(&PollMessage{
-		MsgID:      req.MsgID,
-		RoomID:     req.RoomID,
-		SenderID:   req.Sender,
-		Content:    req.Content,
-		Intent:     req.Intent,
+		MsgID:    req.MsgID,
+		RoomID:   req.RoomID,
+		SenderID: req.Sender,
+		Content:  req.Content,
+		Intent:   req.Intent,
 	}, memoryWin)
 
 	w.WriteHeader(http.StatusOK)
@@ -432,16 +435,97 @@ func (x *XClient) handleStatus(w http.ResponseWriter, r *http.Request) {
 	x.roomsMu.RUnlock()
 
 	status := map[string]interface{}{
-		"agent_id":      x.agentID,
-		"status":        "running",
-		"poll_interval": x.pollInterval,
-		"message_count": msgCount,
-		"room_count":    roomCount,
+		"agent_id":       x.agentID,
+		"status":         "running",
+		"poll_interval":  x.pollInterval,
+		"message_count":  msgCount,
+		"room_count":     roomCount,
 		"memory_windows": len(x.memoryWins),
 	}
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(status)
+}
+
+// handleAgentSendMessage 处理 Agent 主动发送消息的请求
+// Agent 调用此接口将消息通过 x-client 代理发送到 Coordinator
+func (x *XClient) handleAgentSendMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持 POST 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AgentSendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "无效的请求体: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 设置默认值
+	if req.TargetID == "" {
+		req.TargetID = "ALL"
+	}
+	if req.Intent == "" {
+		req.Intent = "INFORM"
+	}
+
+	// 构建发送到 Coordinator 的请求
+	coordinatorReq := SendMessageRequest{
+		RoomID:       req.RoomID,
+		SenderID:     x.agentID,
+		SenderType:   "agent",
+		Content:      req.Content,
+		TargetID:     req.TargetID,
+		MentionUsers: req.MentionUsers,
+		Intent:       req.Intent,
+		ReplyToMsgID: req.ReplyToMsgID,
+	}
+	jsonData, _ := json.Marshal(coordinatorReq)
+
+	log.Printf("[INFO] [%s] [代理发送] 收到 Agent 发送请求，转发到 Coordinator: room=%s, content=%s",
+		x.agentID, req.RoomID, truncate(req.Content, 50))
+
+	// 调用 Coordinator 的 /api/message 接口
+	resp, err := x.httpClient.Post(
+		x.coordinatorURL+"/api/message",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+	if err != nil {
+		log.Printf("[ERROR] [%s] [代理发送] 调用 Coordinator 失败: %v", x.agentID, err)
+		json.NewEncoder(w).Encode(AgentSendMessageResponse{
+			Success: false,
+			Error:   "发送失败: " + err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	// 解析 Coordinator 的响应
+	var sendResp SendMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sendResp); err != nil {
+		log.Printf("[ERROR] [%s] [代理发送] 解析 Coordinator 响应失败: %v", x.agentID, err)
+		json.NewEncoder(w).Encode(AgentSendMessageResponse{
+			Success: false,
+			Error:   "解析响应失败: " + err.Error(),
+		})
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK || !sendResp.Success {
+		log.Printf("[ERROR] [%s] [代理发送] Coordinator 返回错误: %s", x.agentID, sendResp.Error)
+		json.NewEncoder(w).Encode(AgentSendMessageResponse{
+			Success: false,
+			Error:   sendResp.Error,
+		})
+		return
+	}
+
+	log.Printf("[INFO] [%s] [代理发送] 消息发送成功: msg_id=%s", x.agentID, sendResp.MsgID)
+	json.NewEncoder(w).Encode(AgentSendMessageResponse{
+		Success: true,
+		MsgID:   sendResp.MsgID,
+	})
 }
 
 // ============ 启动和关闭 ============
