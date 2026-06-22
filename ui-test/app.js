@@ -69,6 +69,7 @@ class AgentTest {
                     online: member.member_type === 'agent' ? (member.agent_status === 'ONLINE') : member.is_active,
                     is_active: member.is_active,
                     agent_status: member.agent_status,
+                    wsEstablished: member.ws_established,
                     joinedAt: member.joined_at
                 }));
 
@@ -834,30 +835,32 @@ class AgentTest {
         } else if (data.type === 'member_status') {
             // 后端主动推送的成员在线状态
             const msg = data.data;
-            if (msg.room_id === this.currentChannelId || msg.roomId === this.currentChannelId) {
-                // 更新成员状态
+            if (msg.roomId === this.currentChannelId) {
+                // 更新成员状态（适配后端驼峰命名）
                 const members = msg.members || [];
                 const normalizedMembers = members.map(member => ({
-                    agentId: member.member_id,
-                    memberId: member.member_id,
-                    memberType: member.member_type,
-                    member_type: member.member_type,
-                    online: member.member_type === 'agent' ? (member.agent_status === 'ONLINE') : member.is_active,
-                    is_active: member.is_active,
-                    agent_status: member.agent_status,
+                    agentId: member.memberId,
+                    memberId: member.memberId,
+                    memberType: member.memberType,
+                    member_type: member.memberType,
+                    // Agent 在线状态由 agents 表的 status 字段决定，user 由 members 表的 is_active 决定
+                    online: member.memberType === 'agent' ? (member.agentStatus === 'ONLINE') : member.isActive,
+                    is_active: member.isActive,
+                    agent_status: member.agentStatus,
+                    wsEstablished: member.wsEstablished,
                 }));
 
                 // 更新缓存
-                this.roomMembers[msg.room_id || msg.roomId] = normalizedMembers;
-                this.memberStatus[msg.room_id || msg.roomId] = {};
+                this.roomMembers[msg.roomId] = normalizedMembers;
+                this.memberStatus[msg.roomId] = {};
                 normalizedMembers.forEach(member => {
-                    this.memberStatus[msg.room_id || msg.roomId][member.agentId] = {
+                    this.memberStatus[msg.roomId][member.agentId] = {
                         online: member.online
                     };
                 });
 
                 // 更新当前聊天室成员
-                if (msg.room_id === this.currentChannelId || msg.roomId === this.currentChannelId) {
+                if (msg.roomId === this.currentChannelId) {
                     this.currentMembers = normalizedMembers;
                     this.renderMembersPanel();
                 }

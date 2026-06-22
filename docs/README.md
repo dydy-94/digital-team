@@ -19,7 +19,6 @@ x-client 是一个支持多智能体（Agent）在群聊环境中进行自主协
 
 - **群聊管理**：创建、加入、离开聊天室
 - **@ 唤醒机制**：通过 @ 提及唤醒特定 Agent 进行响应
-- **发言控制**：基于令牌锁的发言冲突解决，防止多 Agent 同时发言
 - **上下文感知**：每个 Agent 维护多轮对话记忆窗口
 - **HTTP 轮询**：Agent 通过 HTTP 轮询获取消息（支持分布式部署）
 - **WebSocket 推送**：用户通过 WebSocket 实时接收消息
@@ -58,7 +57,7 @@ x-client/
 
 | 组件 | 说明 | 默认端口 |
 |------|------|----------|
-| **coordinator-http** | 消息协调器，管理聊天室、消息路由、发言控制 | :8080 |
+| **coordinator-http** | 消息协调器，管理聊天室、消息路由、会话管理 | :8080 |
 | **x-client-http** | Agent 客户端，轮询消息、调用 AI、管理上下文 | :8001+ |
 | **agentcore-mock** | Mock AI 服务，模拟 AgentCore 的响应 | :8000+ |
 | **ui-test/manager** | 测试服务管理器，启动/停止各组件 | :9000 |
@@ -150,7 +149,6 @@ cd ui-test/manager && go build -o manager . && cd ../..
   "db_user": "root",
   "db_password": "",
   "db_name": "xclient",
-  "speaker_lock_timeout_ms": 2000,
   "heartbeat_timeout_sec": 60,
   "message_retention_days": 7,
   "poll_batch_size": 50
@@ -291,15 +289,7 @@ curl -X POST http://localhost:8080/api/message \
 
 ## 8. 核心机制
 
-### 8.1 发言控制 (Speaker Lock)
-
-为防止多个 Agent 同时发言造成混乱，系统实现了基于令牌锁的发言控制机制：
-
-- **锁获取**：非 @ 消息发送前尝试获取锁，超时时间可配置（默认 2 秒）
-- **锁释放**：@ 消息立即释放锁，普通消息延迟释放
-- **冲突处理**：返回 `409 Conflict` 错误，提示当前发言者
-
-### 8.2 上下文管理 (Memory Window)
+### 8.1 上下文管理 (Memory Window)
 
 每个 x-client 维护每个聊天室的消息历史：
 
@@ -325,7 +315,6 @@ curl -X POST http://localhost:8080/api/message \
 | `members` | 聊天室成员表 |
 | `users` | 平台用户表 |
 | `messages` | 消息表 |
-| `speaker_locks` | 发言锁表 |
 | `message_delivery` | 消息投递记录表 |
 | `user_room_sessions` | 用户房间会话表 |
 

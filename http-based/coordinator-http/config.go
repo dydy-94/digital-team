@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 )
 
 type Config struct {
@@ -18,9 +19,6 @@ type Config struct {
 	DBPassword string `json:"db_password"`
 	DBName     string `json:"db_name"`
 
-	// 发言锁配置
-	SpeakerLockTimeout int `json:"speaker_lock_timeout_ms"`
-
 	// 心跳超时
 	HeartbeatTimeout int `json:"heartbeat_timeout_sec"`
 
@@ -29,6 +27,16 @@ type Config struct {
 
 	// 轮询配置
 	PollBatchSize int `json:"poll_batch_size"`
+
+	// 超时配置（毫秒）
+	CleanupIntervalMs      int `json:"cleanup_interval_ms"`       // 连接清理间隔
+	PingTimeoutMs          int `json:"ping_timeout_ms"`           // Ping超时
+	PollIntervalMs         int `json:"poll_interval_ms"`          // 消息轮询间隔
+	MemberStatusIntervalMs int `json:"member_status_interval_ms"` // 成员状态推送间隔
+	MessageSendTimeoutMs   int `json:"message_send_timeout_ms"`   // 消息发送超时
+
+	// 日志级别配置
+	LogLevel string `json:"log_level"` // debug, info, warn, error
 }
 
 var configPath string
@@ -49,10 +57,19 @@ func LoadConfig() (*Config, error) {
 		DBPassword: "",
 		DBName:     "xclient",
 
-		SpeakerLockTimeout: 2000,
-		HeartbeatTimeout:   60,
+		HeartbeatTimeout:     60,
 		MessageRetentionDays: 7,
-		PollBatchSize:     50,
+		PollBatchSize:        50,
+
+		// 超时配置默认值（毫秒）
+		CleanupIntervalMs:      300000, // 5分钟（清理任务间隔）
+		PingTimeoutMs:          100,    // 100毫秒
+		PollIntervalMs:         500,    // 500毫秒
+		MemberStatusIntervalMs: 30000,  // 30秒
+		MessageSendTimeoutMs:   2000,   // 2秒
+
+		// 日志级别配置
+		LogLevel: "info", // 默认 info
 	}
 
 	// 1. 尝试从配置文件加载
@@ -97,4 +114,40 @@ func LoadConfig() (*Config, error) {
 func (c *Config) GetDSN() string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		c.DBUser, c.DBPassword, c.DBHost, c.DBPort, c.DBName)
+}
+
+// 超时配置辅助方法
+func (c *Config) GetCleanupInterval() time.Duration {
+	if c.CleanupIntervalMs <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.CleanupIntervalMs) * time.Millisecond
+}
+
+func (c *Config) GetPingTimeout() time.Duration {
+	if c.PingTimeoutMs <= 0 {
+		return 100 * time.Millisecond
+	}
+	return time.Duration(c.PingTimeoutMs) * time.Millisecond
+}
+
+func (c *Config) GetPollInterval() time.Duration {
+	if c.PollIntervalMs <= 0 {
+		return 500 * time.Millisecond
+	}
+	return time.Duration(c.PollIntervalMs) * time.Millisecond
+}
+
+func (c *Config) GetMemberStatusInterval() time.Duration {
+	if c.MemberStatusIntervalMs <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.MemberStatusIntervalMs) * time.Millisecond
+}
+
+func (c *Config) GetMessageSendTimeout() time.Duration {
+	if c.MessageSendTimeoutMs <= 0 {
+		return 2 * time.Second
+	}
+	return time.Duration(c.MessageSendTimeoutMs) * time.Millisecond
 }

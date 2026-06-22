@@ -95,34 +95,16 @@ CREATE TABLE IF NOT EXISTS messages (
     delivered_at DATETIME NULL,
     read_at DATETIME NULL,
 
-    -- 发言锁相关（用于协调发言顺序）
-    speaker_lock VARCHAR(64) NULL COMMENT '当前持有发言锁的 agent_id',
-    lock_expires_at DATETIME NULL COMMENT '锁过期时间',
-
     INDEX idx_room_created (room_id, created_at DESC),
     INDEX idx_target_status (target_id, status, created_at DESC),
     INDEX idx_sender_created (sender_id, created_at DESC),
     INDEX idx_mention_users (mention_users(255)),
     INDEX idx_status_created (status, created_at),
-    INDEX idx_lock_expires (lock_expires_at),
 
     FOREIGN KEY (room_id) REFERENCES rooms(room_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='消息表';
 
--- 6. 发言锁记录表（分布式锁）
-CREATE TABLE IF NOT EXISTS speaker_locks (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    room_id VARCHAR(64) UNIQUE NOT NULL COMMENT '聊天室 ID',
-    holder_id VARCHAR(64) NOT NULL COMMENT '锁持有者 ID',
-    holder_type VARCHAR(32) NOT NULL COMMENT 'agent / user',
-    acquired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME NOT NULL COMMENT '锁过期时间',
-
-    INDEX idx_room_id (room_id),
-    INDEX idx_expires (expires_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='发言锁表';
-
--- 7. 消息投递记录表（追踪消息是否已被 poll 拉取和 WebSocket 通知）
+-- 6. 消息投递记录表（追踪消息是否已被 poll 拉取和 WebSocket 通知）
 CREATE TABLE IF NOT EXISTS message_delivery (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     msg_id VARCHAR(64) NOT NULL COMMENT '消息 ID',

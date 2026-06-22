@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -78,12 +78,12 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.storage.RegisterAgent(req.AgentID, req.Endpoint); err != nil {
-		log.Printf("[ERROR] 注册 Agent 失败: %v", err)
+		slog.Error("注册 Agent 失败", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "注册失败")
 		return
 	}
 
-	log.Printf("[INFO] Agent 注册成功: %s, endpoint: %s", req.AgentID, req.Endpoint)
+	slog.Info("Agent 注册成功", "agent_id", req.AgentID, "endpoint", req.Endpoint)
 
 	h.writeJSON(w, http.StatusOK, RegisterResponse{
 		Success: true,
@@ -100,7 +100,7 @@ func (h *Handler) HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.storage.UpdateHeartbeat(req.AgentID); err != nil {
-		log.Printf("[WARN] 更新心跳失败: %s, error: %v", req.AgentID, err)
+		slog.Warn("更新心跳失败", "agent_id", req.AgentID, "error", err)
 	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -129,7 +129,7 @@ func (h *Handler) PollHandler(w http.ResponseWriter, r *http.Request) {
 	// 轮询消息
 	messages, nextSince, err := h.storage.PollMessages(agentID, since, roomID, limit)
 	if err != nil {
-		log.Printf("[ERROR] 轮询消息失败: %v", err)
+		slog.Error("轮询消息失败", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "轮询失败")
 		return
 	}
@@ -186,7 +186,7 @@ func (h *Handler) SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(invalidAgents) > 0 {
 			// 返回警告但不阻止消息发送
-			log.Printf("[WARN] 消息引用了不存在的 agent: %v", invalidAgents)
+			slog.Warn("消息引用了不存在的 agent", "invalid_agents", invalidAgents)
 			// 异步通知发送者
 			go func() {
 				h.notifySender(req.SenderID, req.RoomID, "warning",
@@ -218,15 +218,12 @@ func (h *Handler) SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 保存消息
 	if err := h.storage.SaveMessage(msg); err != nil {
-		log.Printf("[ERROR] 保存消息失败: %v", err)
+		slog.Error("保存消息失败", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "保存消息失败")
 		return
 	}
 
-	log.Printf("[INFO] 消息已保存: %s, room: %s, sender: %s", msgID, req.RoomID, req.SenderID)
-
-	// 禁用旧的广播机制，改用 notificationPump 轮询推送
-	// go h.broadcastToUsers(req.RoomID, msg)
+	slog.Info("消息已保存", "msg_id", msgID, "room", req.RoomID, "sender", req.SenderID)
 
 	h.writeJSON(w, http.StatusOK, SendMessageResponse{
 		Success: true,
@@ -268,7 +265,7 @@ func (h *Handler) RegisterUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[INFO] 用户注册成功: %s (nickname: %s)", userID, nickname)
+	slog.Info("用户注册成功", "user_id", userID, "nickname", nickname)
 
 	h.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -386,7 +383,7 @@ func (h *Handler) CreateRoomHandler(w http.ResponseWriter, r *http.Request) {
 		h.storage.AddMember(roomID, memberID, memberType)
 	}
 
-	log.Printf("[INFO] 聊天室创建成功: %s, name: %s", roomID, req.Name)
+	slog.Info("聊天室创建成功", "room_id", roomID, "name", req.Name)
 
 	h.writeJSON(w, http.StatusOK, CreateRoomResponse{
 		Success: true,
@@ -457,7 +454,7 @@ func (h *Handler) JoinRoomHandler(w http.ResponseWriter, r *http.Request) {
 	// 获取历史消息
 	history, _ := h.storage.GetRecentMessages(req.RoomID, 50)
 
-	log.Printf("[INFO] 成员加入聊天室: %s -> %s (%s), sessionID=%d, reused=%v", req.MemberID, req.RoomID, req.MemberType, sessionID, isReused)
+	slog.Info("成员加入聊天室", "member_id", req.MemberID, "room_id", req.RoomID, "member_type", req.MemberType, "session_id", sessionID, "reused", isReused)
 
 	h.writeJSON(w, http.StatusOK, JoinRoomResponse{
 		Success:   true,
@@ -478,7 +475,7 @@ func (h *Handler) LeaveRoomHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[INFO] 成员离开聊天室: %s <- %s", roomID, memberID)
+	slog.Info("成员离开聊天室", "room_id", roomID, "member_id", memberID)
 
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
@@ -502,7 +499,7 @@ func (h *Handler) LeaveRoomPOSTHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[INFO] 成员离开聊天室: %s <- %s", req.RoomID, req.MemberID)
+	slog.Info("成员离开聊天室", "room_id", req.RoomID, "member_id", req.MemberID)
 
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
@@ -603,8 +600,6 @@ func (h *Handler) ChatWSHandler(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room_id")
 	sessionIDStr := r.URL.Query().Get("session_id")
 
-	log.Printf("[DEBUG] ChatWSHandler 收到请求: URL=%s, userID=%s, roomID=%s, sessionID=%s", r.URL.String(), userID, roomID, sessionIDStr)
-
 	if userID == "" {
 		http.Error(w, "user_id required", http.StatusBadRequest)
 		return
@@ -619,7 +614,7 @@ func (h *Handler) UserWSHandler(w http.ResponseWriter, r *http.Request) {
 	roomID := r.URL.Query().Get("room_id")
 	sessionIDStr := r.URL.Query().Get("session_id")
 
-	log.Printf("[DEBUG] UserWSHandler 收到请求: URL=%s, userID=%s, roomID=%s, sessionID=%s", r.URL.String(), userID, roomID, sessionIDStr)
+	slog.Debug("ChatWSHandler 收到请求", "url", r.URL.String(), "user_id", userID, "room_id", roomID, "session_id", sessionIDStr)
 
 	if userID == "" {
 		http.Error(w, "user_id required", http.StatusBadRequest)
@@ -635,7 +630,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 	// 升级为 WebSocket
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[ERROR] WebSocket 升级失败: %v", err)
+		slog.Error("WebSocket 升级失败", "error", err)
 		return
 	}
 
@@ -653,7 +648,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 
 	// 确保资源正确清理的 defer 函数
 	defer func() {
-		log.Printf("[INFO] WebSocket 连接已关闭: userID=%s, connectionID=%s", userID, connectionID)
+		slog.Info("WebSocket 连接已关闭", "user_id", userID, "connection_id", connectionID)
 		// 关闭通道，通知协程停止
 		close(userConn.CloseChan)
 		// 等待协程结束（简单的等待方式，防止资源泄漏）
@@ -670,12 +665,12 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 
 	// 如果指定了 room_id 和 session_id，验证并更新会话状态
 	if roomID != "" && sessionIDStr != "" {
-		log.Printf("[DEBUG] WS 收到 session_id: userID=%s, roomID=%s, sessionIDStr=%s", userID, roomID, sessionIDStr)
+		slog.Debug("WS 收到 session_id", "user_id", userID, "room_id", roomID, "session_id", sessionIDStr)
 		// 解析 session_id
 		var sessionID int64
 		if _, err := fmt.Sscanf(sessionIDStr, "%d", &sessionID); err != nil {
 			// session_id 无效，拒绝连接
-			log.Printf("[WARN] 无效的 session_id: %s", sessionIDStr)
+			slog.Warn("无效的 session_id", "session_id", sessionIDStr)
 			h.sendWarningAndClose(conn, roomID, "无效的 session_id，请重新加入聊天室")
 			return
 		}
@@ -683,14 +678,14 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 		// 更新会话状态为 ws_established=true，并设置 connection_id
 		if err := h.storage.UpdateUserRoomSessionWsEstablishedWithConnection(sessionID, connectionID, userID, roomID); err != nil {
 			// 会话验证失败，拒绝连接
-			log.Printf("[WARN] 会话验证失败: sessionID=%d, userID=%s, roomID=%s, err=%v", sessionID, userID, roomID, err)
+			slog.Warn("会话验证失败", "session_id", sessionID, "user_id", userID, "room_id", roomID, "error", err)
 			h.sendWarningAndClose(conn, roomID, "会话验证失败，请重新加入聊天室")
 			return
 		}
 		userConn.Rooms[roomID] = true
-		log.Printf("[INFO] WS 连接验证成功: userID=%s, roomID=%s, sessionID=%d, connectionID=%s", userID, roomID, sessionID, connectionID)
+		slog.Info("WS 连接验证成功", "user_id", userID, "room_id", roomID, "session_id", sessionID, "connection_id", connectionID)
 	} else {
-		log.Printf("[DEBUG] WS 未携带 session_id: userID=%s, roomID=%s, sessionIDStr=%s", userID, roomID, sessionIDStr)
+		slog.Debug("WS 未携带 session_id", "user_id", userID, "room_id", roomID, "session_id", sessionIDStr)
 	}
 
 	// 从数据库加载用户已订阅的房间列表（仅恢复 ws_established=TRUE 的订阅）
@@ -706,7 +701,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 			}
 		}
 		if validCount > 0 {
-			log.Printf("[INFO] 从数据库恢复 %d 个有效房间订阅(ws_established=TRUE): userID=%s", validCount, userID)
+			slog.Info("从数据库恢复有效房间订阅", "count", validCount, "user_id", userID)
 		}
 	}
 
@@ -721,7 +716,7 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, userID
 	}
 	h.userConnsMu.Unlock()
 
-	log.Printf("[INFO] WebSocket 连接已建立: userID=%s, connectionID=%s", userID, connectionID)
+	slog.Info("WebSocket 连接已建立", "user_id", userID, "connection_id", connectionID)
 
 	// 启动读写协程和投递轮询协程
 	go h.userWritePump(userConn)
@@ -736,10 +731,9 @@ func (h *Handler) userReadPump(conn *UserConn) {
 
 		// 立即更新数据库：将 ws_established 设为 FALSE
 		if err := h.storage.UpdateUserRoomSessionWsEstablished(conn.ConnectionID, false); err != nil {
-			log.Printf("[WARN] 更新 ws_established 失败: connectionID=%s, err=%v", conn.ConnectionID, err)
+			slog.Warn("更新 ws_established 失败", "connection_id", conn.ConnectionID, "error", err)
 		} else {
-			log.Printf("[INFO] WebSocket 断开，已更新 ws_established=FALSE: connectionID=%s, userID=%s",
-				conn.ConnectionID, conn.UserID)
+			slog.Info("WebSocket 断开，已更新 ws_established=FALSE", "connection_id", conn.ConnectionID, "user_id", conn.UserID)
 		}
 	}()
 
@@ -795,7 +789,7 @@ func (h *Handler) userReadPump(conn *UserConn) {
 				h.userRooms[conn.UserID][roomID] = true
 				h.userRoomsMu.Unlock()
 
-				log.Printf("[INFO] WebSocket 用户加入聊天室: %s -> %s", conn.UserID, roomID)
+				slog.Info("WebSocket 用户加入聊天室", "user_id", conn.UserID, "room_id", roomID)
 			}
 
 		case "leave":
@@ -812,7 +806,7 @@ func (h *Handler) userReadPump(conn *UserConn) {
 				// 从数据库删除会话
 				h.storage.DeleteUserRoomSession(conn.UserID, roomID)
 
-				log.Printf("[INFO] WebSocket 用户离开聊天室: %s <- %s", roomID, conn.UserID)
+				slog.Info("WebSocket 用户离开聊天室", "room_id", roomID, "user_id", conn.UserID)
 			}
 
 		case "message":
@@ -879,14 +873,14 @@ func (h *Handler) handleSpeakMessage(conn *UserConn, data map[string]interface{}
 	mentionUsers := getStringArray("mentionUsers")
 
 	if roomID == "" || content == "" {
-		log.Printf("[WARN] speak 消息缺少必要参数: roomID=%s, content=%s", roomID, content)
+		slog.Warn("speak 消息缺少必要参数", "room_id", roomID, "content", content)
 		return
 	}
 
 	// 验证聊天室存在
 	room, err := h.storage.GetRoom(roomID)
 	if err != nil || room == nil {
-		log.Printf("[WARN] speak 消息聊天室不存在: %s", roomID)
+		slog.Warn("speak 消息聊天室不存在", "room_id", roomID)
 		return
 	}
 
@@ -896,7 +890,7 @@ func (h *Handler) handleSpeakMessage(conn *UserConn, data map[string]interface{}
 		// 如果 sender 不在成员列表中，尝试使用 conn.UserID
 		isMember, _ = h.storage.IsMemberInRoom(roomID, conn.UserID)
 		if !isMember {
-			log.Printf("[WARN] 发送者不是聊天室成员: %s, room: %s", sender, roomID)
+			slog.Warn("发送者不是聊天室成员", "sender", sender, "room_id", roomID)
 			return
 		}
 		sender = conn.UserID
@@ -941,19 +935,16 @@ func (h *Handler) handleSpeakMessage(conn *UserConn, data map[string]interface{}
 
 	// 保存消息
 	if err := h.storage.SaveMessage(wsMsg); err != nil {
-		log.Printf("[ERROR] 通过 WebSocket 保存消息失败: %v", err)
+		slog.Error("通过 WebSocket 保存消息失败", "error", err)
 		return
 	}
 
-	log.Printf("[INFO] WebSocket 消息已保存: %s, room: %s, sender: %s", msgID, roomID, sender)
-
-	// 禁用旧的广播机制，改用 notificationPump 轮询推送
-	// go h.broadcastToUsers(roomID, wsMsg)
+	slog.Info("WebSocket 消息已保存", "msg_id", msgID, "room", roomID, "sender", sender)
 }
 
 func (h *Handler) userWritePump(conn *UserConn) {
 	defer func() {
-		log.Printf("[DEBUG] userWritePump: 协程结束: userID=%s", conn.UserID)
+		slog.Debug("userWritePump: 协程结束", "user_id", conn.UserID)
 		conn.Conn.Close()
 		// 确保通道只关闭一次，避免 panic
 		defer func() {
@@ -966,62 +957,24 @@ func (h *Handler) userWritePump(conn *UserConn) {
 		select {
 		case message, ok := <-conn.Send:
 			if !ok {
-				log.Printf("[DEBUG] userWritePump: 发送通道已关闭: userID=%s", conn.UserID)
+				slog.Debug("userWritePump: 发送通道已关闭", "user_id", conn.UserID)
 				return
 			}
 
-			log.Printf("[DEBUG] userWritePump: 准备发送消息到 WebSocket: userID=%s, 消息长度=%d", conn.UserID, len(message))
+			slog.Debug("userWritePump: 准备发送消息到 WebSocket", "user_id", conn.UserID, "len", len(message))
 			if err := conn.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				log.Printf("[ERROR] userWritePump: 发送消息到 WebSocket 失败: userID=%s, err=%v", conn.UserID, err)
+				slog.Error("userWritePump: 发送消息到 WebSocket 失败", "user_id", conn.UserID, "error", err)
 
 				// 发送失败，不立即返回，继续尝试发送下一条消息
 				continue
 			}
-			log.Printf("[DEBUG] userWritePump: 消息发送成功: userID=%s", conn.UserID)
+			slog.Debug("userWritePump: 消息发送成功", "user_id", conn.UserID)
 
 		case <-conn.CloseChan:
-			log.Printf("[DEBUG] userWritePump: 收到关闭信号: userID=%s", conn.UserID)
+			slog.Debug("userWritePump: 收到关闭信号", "user_id", conn.UserID)
 			return
 		}
 	}
-}
-
-// broadcastToUsers 广播消息给聊天室的所有在线用户
-func (h *Handler) broadcastToUsers(roomID string, msg *Message) {
-	wsMsg := WSMessage{
-		Type: "message",
-		Data: h.messageToWSData(msg),
-	}
-	data, _ := json.Marshal(wsMsg)
-
-	// log.Printf("[DEBUG] 开始广播消息: room=%s, sender=%s, content=%.30s", roomID, msg.SenderID, msg.Content)
-
-	h.userConnsMu.RLock()
-	defer h.userConnsMu.RUnlock()
-
-	// log.Printf("[DEBUG] 当前在线用户数: %d", len(h.userConns))
-
-	sentCount := 0
-	for userID, conn := range h.userConns {
-		conn.RoomsMu.RLock()
-		isInRoom := conn.Rooms[roomID]
-		conn.RoomsMu.RUnlock()
-
-		// log.Printf("[DEBUG] 检查用户 %s: 在房间中=%v, 订阅房间数=%d", userID, isInRoom, roomCount)
-
-		if isInRoom {
-			select {
-			case conn.Send <- data:
-				sentCount++
-				// log.Printf("[DEBUG] 已发送消息给用户: %s", userID)
-			default:
-				// 连接缓冲区满，跳过
-				log.Printf("[WARN] User %s 消息缓冲区满，跳过", userID)
-			}
-		}
-	}
-
-	// log.Printf("[DEBUG] 广播完成: 发送了 %d 个用户", sentCount)
 }
 
 func (h *Handler) messageToWSData(msg *Message) map[string]interface{} {
@@ -1031,50 +984,81 @@ func (h *Handler) messageToWSData(msg *Message) map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"msg_id":          msg.MsgID,
-		"room_id":         msg.RoomID,
-		"channelId":       msg.RoomID, // 兼容前端
-		"sender_id":       msg.SenderID,
-		"sender":          msg.SenderID, // 兼容前端
-		"sender_type":     msg.SenderType,
-		"content":         msg.Content,
-		"contentText":     msg.Content, // 兼容前端
-		"mention_users":   mentionUsers,
-		"mentionUsers":    mentionUsers, // 兼容前端
-		"intent":          msg.Intent,
-		"reply_to_msg_id": msg.ReplyToMsgID,
-		"created_at":      msg.CreatedAt.Unix(),
+		"msgId":        msg.MsgID,
+		"roomId":       msg.RoomID,
+		"channelId":    msg.RoomID,
+		"senderId":     msg.SenderID,
+		"sender":       msg.SenderID,
+		"senderType":   msg.SenderType,
+		"content":      msg.Content,
+		"contentText":  msg.Content,
+		"mentionUsers": mentionUsers,
+		"intent":       msg.Intent,
+		"replyToMsgId": msg.ReplyToMsgID,
+		"createdAt":    msg.CreatedAt.Unix(),
 	}
 }
 
 // cleanupUserConnections 定期清理断开的连接
+// 使用非阻塞 Ping 检测，避免阻塞主循环
 func (h *Handler) cleanupUserConnections() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(h.cfg.GetCleanupInterval())
 	defer ticker.Stop()
 
 	for range ticker.C {
-		h.userConnsMu.Lock()
-		var closedConnIDs []string
+		// 先收集所有连接信息，不加锁
+		h.userConnsMu.RLock()
+		connInfos := make([]struct {
+			connectionID string
+			userID       string
+			conn         *websocket.Conn
+		}, 0, len(h.userConns))
 		for connectionID, conn := range h.userConns {
-			// 使用 Ping 方法检查连接是否已关闭，避免阻塞
-			err := conn.Conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(1*time.Second))
+			connInfos = append(connInfos, struct {
+				connectionID string
+				userID       string
+				conn         *websocket.Conn
+			}{connectionID: connectionID, userID: conn.UserID, conn: conn.Conn})
+		}
+		h.userConnsMu.RUnlock()
+
+		// 使用 SetWriteDeadline 进行非阻塞 Ping 检测
+		pingTimeout := h.cfg.GetPingTimeout()
+		var closedConnIDs []string
+		for _, info := range connInfos {
+			// 设置 Ping 超时，避免阻塞
+			info.conn.SetWriteDeadline(time.Now().Add(pingTimeout))
+			err := info.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(pingTimeout))
 			if err != nil {
-				delete(h.userConns, connectionID)
-				closedConnIDs = append(closedConnIDs, connectionID)
-				// 安全关闭 channel（如果已经关闭会 panic）
-				defer func() {
-					recover()
-				}()
-				close(conn.Send)
-				close(conn.CloseChan)
-				log.Printf("[INFO] 清理断开用户连接: connectionID=%s, userID=%s", connectionID, conn.UserID)
+				// 连接已断开，收集ID
+				closedConnIDs = append(closedConnIDs, info.connectionID)
+			} else {
+				// 重置为永久截止时间
+				info.conn.SetWriteDeadline(time.Time{})
 			}
 		}
-		h.userConnsMu.Unlock()
 
-		// 从数据库清理断开的会话
-		for _, connectionID := range closedConnIDs {
-			h.storage.DeleteUserRoomSessionByConnection(connectionID)
+		if len(closedConnIDs) > 0 {
+			// 从内存中删除断开的连接
+			h.userConnsMu.Lock()
+			for _, connectionID := range closedConnIDs {
+				if conn, ok := h.userConns[connectionID]; ok {
+					delete(h.userConns, connectionID)
+					// 安全关闭 channel（如果已经关闭会 panic）
+					defer func() {
+						recover()
+					}()
+					close(conn.Send)
+					close(conn.CloseChan)
+					slog.Info("清理断开用户连接", "connection_id", connectionID, "user_id", conn.UserID)
+				}
+			}
+			h.userConnsMu.Unlock()
+
+			// 从数据库清理断开的会话
+			for _, connectionID := range closedConnIDs {
+				h.storage.DeleteUserRoomSessionByConnection(connectionID)
+			}
 		}
 	}
 }
@@ -1102,8 +1086,9 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, message string) 
 func (h *Handler) notificationPump(conn *UserConn) {
 	// log.Printf("[DEBUG] 启动消息投递轮询: userID=%s", conn.UserID)
 
-	pollInterval := 500 * time.Millisecond   // 消息轮询间隔 500ms
-	memberStatusInterval := 30 * time.Second // 成员状态推送间隔 30 秒
+	pollInterval := h.cfg.GetPollInterval()                 // 消息轮询间隔
+	memberStatusInterval := h.cfg.GetMemberStatusInterval() // 成员状态推送间隔
+	messageSendTimeout := h.cfg.GetMessageSendTimeout()     // 消息发送超时
 	lastPolled := time.Now()
 	lastMemberStatusUpdate := time.Now()
 	pollCounter := 0
@@ -1112,19 +1097,19 @@ func (h *Handler) notificationPump(conn *UserConn) {
 		select {
 		case <-conn.CloseChan:
 			// 连接关闭信号
-			// log.Printf("[DEBUG] 停止消息投递轮询: userID=%s", conn.UserID)
+			// log.Printf("停止消息投递轮询: userID=%s", conn.UserID)
 			return
 
 		case <-time.After(pollInterval):
 			// 轮询待通知的消息
 			notifications, err := h.storage.GetPendingNotifications(conn.UserID, lastPolled)
 			if err != nil {
-				log.Printf("[WARN] GetPendingNotifications 失败: userID=%s, err=%v", conn.UserID, err)
+				slog.Warn("GetPendingNotifications 失败", "user_id", conn.UserID, "error", err)
 				continue
 			}
 
 			if len(notifications) > 0 {
-				log.Printf("[INFO] 发现 %d 条待通知消息，推送给用户 %s", len(notifications), conn.UserID)
+				slog.Info("发现待通知消息", "count", len(notifications), "user_id", conn.UserID)
 
 				var notifiedMsgIDs []string
 				for _, n := range notifications {
@@ -1153,19 +1138,19 @@ func (h *Handler) notificationPump(conn *UserConn) {
 					// 发送到 WebSocket，添加超时机制
 					select {
 					case conn.Send <- data:
-						log.Printf("[DEBUG] 已发送通知消息: userID=%s, msg_id=%s, sender=%s", conn.UserID, n.MsgID, n.SenderID)
+						slog.Debug("已发送通知消息", "user_id", conn.UserID, "msg_id", n.MsgID, "sender", n.SenderID)
 						notifiedMsgIDs = append(notifiedMsgIDs, n.MsgID)
-					case <-time.After(2 * time.Second):
-						log.Printf("[WARN] 发送消息超时: userID=%s, msg_id=%s", conn.UserID, n.MsgID)
+					case <-time.After(messageSendTimeout):
+						slog.Warn("发送消息超时", "user_id", conn.UserID, "msg_id", n.MsgID)
 					default:
-						log.Printf("[WARN] 消息缓冲区满，跳过: userID=%s", conn.UserID)
+						slog.Warn("消息缓冲区满，跳过", "user_id", conn.UserID)
 					}
 				}
 
 				// 标记消息已通知
 				if len(notifiedMsgIDs) > 0 {
 					if err := h.storage.MarkNotificationsSent(notifiedMsgIDs, conn.UserID); err != nil {
-						log.Printf("[WARN] MarkNotificationsSent 失败: userID=%s, err=%v", conn.UserID, err)
+						slog.Warn("MarkNotificationsSent 失败", "user_id", conn.UserID, "error", err)
 					}
 				}
 
@@ -1195,29 +1180,30 @@ func (h *Handler) notificationPump(conn *UserConn) {
 
 // pushMemberStatus 推送聊天室成员在线状态（通过 WebSocket，不存入 messages 表）
 func (h *Handler) pushMemberStatus(conn *UserConn, roomID string) {
-	// 获取聊天室成员列表（包含 agent_status）
+	// 获取聊天室成员列表（包含 agent_status 和 ws_established）
 	members, err := h.storage.GetRoomMembers(roomID)
 	if err != nil {
-		log.Printf("[WARN] 获取成员列表失败: roomID=%s, err=%v", roomID, err)
+		slog.Warn("获取成员列表失败", "room_id", roomID, "error", err)
 		return
 	}
 
-	// 构造成员状态消息
+	// 构造成员状态消息（统一使用驼峰命名）
 	memberList := make([]map[string]interface{}, 0, len(members))
 	for _, m := range members {
 		memberList = append(memberList, map[string]interface{}{
-			"member_id":    m.MemberID,
-			"member_type":  m.MemberType,
-			"agent_status": m.AgentStatus,
-			"is_active":    m.IsActive,
-			"joined_at":    m.JoinedAt.Format("2006-01-02T15:04:05Z07:00"),
+			"memberId":      m.MemberID,
+			"memberType":    m.MemberType,
+			"agentStatus":   m.AgentStatus,
+			"isActive":      m.IsActive,
+			"wsEstablished": m.WsEstablished,
+			"joinedAt":      m.JoinedAt.Format("2006-01-02T15:04:05Z07:00"),
 		})
 	}
 
 	wsMsg := map[string]interface{}{
 		"type": "member_status",
 		"data": map[string]interface{}{
-			"room_id": roomID,
+			"roomId":  roomID,
 			"members": memberList,
 		},
 	}
@@ -1256,7 +1242,7 @@ func (h *Handler) notifySender(userID, roomID, msgType, content string) {
 	h.userConnsMu.RUnlock()
 
 	if len(userConns) == 0 {
-		log.Printf("[WARN] 无法通知用户 %s: 没有活跃连接", userID)
+		slog.Warn("无法通知用户：没有活跃连接", "user_id", userID)
 		return
 	}
 
@@ -1264,9 +1250,9 @@ func (h *Handler) notifySender(userID, roomID, msgType, content string) {
 	for _, conn := range userConns {
 		select {
 		case conn.Send <- data:
-			log.Printf("[INFO] 已通知用户 %s (connectionID=%s): %s", userID, conn.ConnectionID, content)
+			slog.Info("已通知用户", "user_id", userID, "connection_id", conn.ConnectionID, "content", content)
 		default:
-			log.Printf("[WARN] 无法通知用户 %s (connectionID=%s): 缓冲区满", userID, conn.ConnectionID)
+			slog.Warn("无法通知用户：缓冲区满", "user_id", userID, "connection_id", conn.ConnectionID)
 		}
 	}
 }
@@ -1311,8 +1297,7 @@ func (h *Handler) sendWarningAndCloseConn(userConn *UserConn, roomID, content st
 	// 从数据库删除会话
 	h.storage.DeleteUserRoomSessionByConnection(userConn.ConnectionID)
 
-	log.Printf("[INFO] 已发送警告并关闭连接: connectionID=%s, userID=%s, content=%s",
-		userConn.ConnectionID, userConn.UserID, content)
+	slog.Info("已发送警告并关闭连接", "connection_id", userConn.ConnectionID, "user_id", userConn.UserID, "content", content)
 }
 
 // sendWarningAndClose 发送警告消息后关闭连接
@@ -1330,7 +1315,7 @@ func (h *Handler) sendWarningAndClose(conn *websocket.Conn, roomID, content stri
 
 	// 关闭连接
 	conn.Close()
-	log.Printf("[INFO] 已发送警告并关闭连接: %s", content)
+	slog.Info("已发送警告并关闭连接", "content", content)
 }
 
 // toJSONArray 将字符串切片转换为 JSON 数组格式字符串

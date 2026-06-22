@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -46,12 +46,12 @@ func NewStorage(cfg *Config) (*Storage, error) {
 
 	// 创建用户会话表
 	if err := s.createUserRoomSessionsTable(); err != nil {
-		log.Printf("创建 user_room_sessions 表失败: %v", err)
+		slog.Error("创建 user_room_sessions 表失败", "error", err)
 	}
 
 	// 初始化加载聊天室成员到内存
 	if err := s.loadMembersToMemory(); err != nil {
-		log.Printf("加载聊天室成员到内存失败: %v", err)
+		slog.Error("加载聊天室成员到内存失败", "error", err)
 	}
 
 	// 启动定期清理任务
@@ -272,12 +272,15 @@ func (s *Storage) RemoveMember(roomID, memberID string) error {
 
 // GetRoomMembers 获取聊天室成员
 // 对于 agent 类型的成员，同时返回 agents 表的在线状态
+// 对于 user 类型的成员，通过 user_room_sessions 表判断 ws_established
 func (s *Storage) GetRoomMembers(roomID string) ([]*Member, error) {
 	query := `
 		SELECT m.id, m.room_id, m.member_id, m.member_type, m.joined_at, m.left_at, m.is_active,
-		       a.status AS agent_status
+		       a.status AS agent_status,
+		       COALESCE(urs.ws_established, FALSE) AS ws_established
 		FROM members m
 		LEFT JOIN agents a ON m.member_id = a.agent_id AND m.member_type = 'agent'
+		LEFT JOIN user_room_sessions urs ON m.member_id = urs.user_id AND m.room_id = urs.room_id AND urs.ws_established = TRUE
 		WHERE m.room_id = ? AND m.is_active = TRUE
 	`
 	rows, err := s.db.Query(query, roomID)
@@ -291,7 +294,7 @@ func (s *Storage) GetRoomMembers(roomID string) ([]*Member, error) {
 		var m Member
 		var leftAt sql.NullTime
 		var agentStatus sql.NullString
-		if err := rows.Scan(&m.ID, &m.RoomID, &m.MemberID, &m.MemberType, &m.JoinedAt, &leftAt, &m.IsActive, &agentStatus); err != nil {
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.MemberID, &m.MemberType, &m.JoinedAt, &leftAt, &m.IsActive, &agentStatus, &m.WsEstablished); err != nil {
 			return nil, err
 		}
 		if leftAt.Valid {
@@ -427,7 +430,7 @@ func (s *Storage) PollMessages(agentID string, since int64, roomID string, limit
 	// 先获取 agent 所在的聊天室
 	rooms, err := s.GetMemberRooms(agentID)
 	if err != nil {
-		log.Printf("[ERROR] GetMemberRooms failed: %v", err)
+		slog.Error("GetMemberRooms failed", "error", err)
 		return nil, 0, err
 	}
 
@@ -474,7 +477,7 @@ func (s *Storage) PollMessages(agentID string, since int64, roomID string, limit
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		log.Printf("[ERROR] PollMessages query failed: %v", err)
+		slog.Error("PollMessages query failed", "error", err)
 		return nil, 0, err
 	}
 	defer rows.Close()
@@ -491,7 +494,7 @@ func (s *Storage) PollMessages(agentID string, since int64, roomID string, limit
 		if err := rows.Scan(&m.MsgID, &m.RoomID, &m.SenderID, &m.SenderType,
 			&m.Content, &mentionUsersJSON, &m.Intent, &replyTo,
 			&m.TargetID, &createdAt); err != nil {
-			log.Printf("[WARN] Scan error: %v", err)
+			slog.Warn("Scan error", "error", err)
 			continue
 		}
 
@@ -584,13 +587,13 @@ func (s *Storage) GetPendingNotifications(userID string, since time.Time) ([]*No
 	// 使用事务确保查询和更新操作的原子性
 	tx, err := s.db.Begin()
 	if err != nil {
-		log.Printf("[ERROR] GetPendingNotifications 开始事务失败: %v", err)
+		slog.Error("GetPendingNotifications 开始事务失败", "error", err)
 		return nil, err
 	}
 
 	rows, err := tx.Query(query, args...)
 	if err != nil {
-		log.Printf("[ERROR] GetPendingNotifications 查询失败: %v", err)
+		slog.Error("GetPendingNotifications 查询失败", "error", err)
 		tx.Rollback()
 		return nil, err
 	}
@@ -607,7 +610,7 @@ func (s *Storage) GetPendingNotifications(userID string, since time.Time) ([]*No
 		if err := rows.Scan(&n.MsgID, &n.RoomID, &n.SenderID, &n.SenderType,
 			&n.Content, &mentionUsersJSON, &n.Intent, &replyTo,
 			&n.TargetID, &createdAt); err != nil {
-			log.Printf("[WARN] Scan error: %v", err)
+			slog.Warn("Scan error", "error", err)
 			continue
 		}
 
@@ -635,13 +638,13 @@ func (s *Storage) GetPendingNotifications(userID string, since time.Time) ([]*No
 	for _, msgID := range msgIDs {
 		_, err = tx.Exec(`INSERT INTO message_delivery (msg_id, recipient_id, notified_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE notified_at = NOW()`, msgID, userID)
 		if err != nil {
-			log.Printf("[WARN] 标记消息已通知失败: msgID=%s, userID=%s, err=%v", msgID, userID, err)
+			slog.Warn("标记消息已通知失败", "msg_id", msgID, "user_id", userID, "error", err)
 		}
 	}
 
 	// 提交事务
 	if err := tx.Commit(); err != nil {
-		log.Printf("[ERROR] GetPendingNotifications 提交事务失败: %v", err)
+		slog.Error("GetPendingNotifications 提交事务失败", "error", err)
 		return nil, err
 	}
 
@@ -667,7 +670,7 @@ func (s *Storage) MarkNotificationsSent(msgIDs []string, userID string) error {
 
 	for _, msgID := range msgIDs {
 		if _, err := stmt.Exec(msgID, userID); err != nil {
-			log.Printf("[WARN] MarkNotificationsSent 失败: msgID=%s, userID=%s, err=%v", msgID, userID, err)
+			slog.Warn("MarkNotificationsSent 失败", "msg_id", msgID, "user_id", userID, "error", err)
 		}
 	}
 	return nil
@@ -743,7 +746,7 @@ func (s *Storage) GetRecentMessages(roomID string, limit int) ([]*Message, error
 
 // startCleanup 启动定期清理
 func (s *Storage) startCleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(s.cfg.GetCleanupInterval())
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -752,6 +755,9 @@ func (s *Storage) startCleanup() {
 
 		// 清理旧消息
 		s.cleanupOldMessages()
+
+		// 清理超时会话（ws_established=FALSE 且 last_active_at 超过5分钟）
+		s.CleanupStaleSessions(5 * time.Minute)
 	}
 }
 
@@ -919,10 +925,36 @@ func (s *Storage) DeleteUserRoomSession(userID, roomID string) error {
 }
 
 // DeleteUserRoomSessionByConnection 删除用户房间会话（按连接ID）
+// 同时更新 members 表的 is_active 状态
 func (s *Storage) DeleteUserRoomSessionByConnection(connectionID string) error {
-	query := `DELETE FROM user_room_sessions WHERE connection_id = ?`
-	_, err := s.db.Exec(query, connectionID)
-	return err
+	// 先获取该连接对应的 user_id 和 room_id，用于更新 members 表
+	var userID, roomID string
+	query := `SELECT user_id, room_id FROM user_room_sessions WHERE connection_id = ?`
+	err := s.db.QueryRow(query, connectionID).Scan(&userID, &roomID)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+
+	// 删除会话
+	delQuery := `DELETE FROM user_room_sessions WHERE connection_id = ?`
+	_, err = s.db.Exec(delQuery, connectionID)
+	if err != nil {
+		return err
+	}
+
+	// 如果成功获取到 userID 和 roomID，更新 members 表的 is_active
+	if userID != "" && roomID != "" {
+		// 检查是否还有其他活跃的会话
+		var count int
+		checkQuery := `SELECT COUNT(*) FROM user_room_sessions WHERE user_id = ? AND room_id = ? AND ws_established = TRUE`
+		s.db.QueryRow(checkQuery, userID, roomID).Scan(&count)
+		if count == 0 {
+			// 没有其他活跃会话，更新 members 表
+			updateQuery := `UPDATE members SET is_active = FALSE, left_at = NOW() WHERE member_id = ? AND room_id = ? AND is_active = TRUE`
+			s.db.Exec(updateQuery, userID, roomID)
+		}
+	}
+	return nil
 }
 
 // GetUserRoomSessions 获取用户的所有房间会话
@@ -973,8 +1005,50 @@ func (s *Storage) UpdateUserRoomSessionActivity(connectionID string) error {
 }
 
 // CleanupStaleSessions 清理超时会话
+// 清理 ws_established=FALSE 且 last_active_at 超过 maxAge 的会话
+// 同时更新对应 members 表的 is_active 状态
 func (s *Storage) CleanupStaleSessions(maxAge time.Duration) error {
-	query := `DELETE FROM user_room_sessions WHERE last_active_at < ?`
-	_, err := s.db.Exec(query, time.Now().Add(-maxAge))
-	return err
+	// 查询需要清理的会话
+	query := `SELECT user_id, room_id FROM user_room_sessions WHERE last_active_at < ? AND ws_established = FALSE`
+	rows, err := s.db.Query(query, time.Now().Add(-maxAge))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// 收集需要更新 is_active 的 member
+	type memberKey struct {
+		userID string
+		roomID string
+	}
+	var membersToUpdate []memberKey
+
+	for rows.Next() {
+		var userID, roomID string
+		if err := rows.Scan(&userID, &roomID); err != nil {
+			continue
+		}
+		membersToUpdate = append(membersToUpdate, memberKey{userID: userID, roomID: roomID})
+	}
+
+	// 删除超时会话
+	delQuery := `DELETE FROM user_room_sessions WHERE last_active_at < ? AND ws_established = FALSE`
+	_, err = s.db.Exec(delQuery, time.Now().Add(-maxAge))
+	if err != nil {
+		return err
+	}
+
+	// 更新对应成员的 is_active 状态
+	for _, mk := range membersToUpdate {
+		// 检查是否还有其他活跃会话
+		var count int
+		checkQuery := `SELECT COUNT(*) FROM user_room_sessions WHERE user_id = ? AND room_id = ? AND ws_established = TRUE`
+		s.db.QueryRow(checkQuery, mk.userID, mk.roomID).Scan(&count)
+		if count == 0 {
+			updateQuery := `UPDATE members SET is_active = FALSE, left_at = NOW() WHERE member_id = ? AND room_id = ? AND is_active = TRUE`
+			s.db.Exec(updateQuery, mk.userID, mk.roomID)
+		}
+	}
+
+	return nil
 }

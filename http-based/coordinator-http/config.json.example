@@ -5,7 +5,6 @@
   "db_user": "root",
   "db_password": "你的密码",
   "db_name": "xclient",
-  "speaker_lock_timeout_ms": 2000,
   "heartbeat_timeout_sec": 60,
   "message_retention_days": 7,
   "poll_batch_size": 50

@@ -36,6 +36,8 @@ type Member struct {
 	// Agent 在线状态（仅对 agent 类型成员有效，user 类型为空）
 	// 由 agents 表的 status 字段决定，反映 x-client 的心跳状态
 	AgentStatus string `json:"agent_status,omitempty" db:"agent_status"`
+	// 用户是否建立了 WebSocket 连接（通过 user_room_sessions 表判断）
+	WsEstablished bool `json:"ws_established,omitempty" db:"ws_established"`
 }
 
 // User 平台用户
