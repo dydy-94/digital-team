@@ -847,6 +847,408 @@ func (s *Storage) createUserRoomSessionsTable() error {
 	return err
 }
 
+// ============ Task 操作 ============
+
+// CreateTask 创建任务
+func (s *Storage) CreateTask(task *Task) error {
+	query := `
+		INSERT INTO tasks (task_id, title, description, status, priority,
+		                   created_by, assigned_to, room_id, parent_task_id,
+		                   created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query,
+		task.TaskID, task.Title, task.Description, task.Status, task.Priority,
+		task.CreatedBy, task.AssignedTo, task.RoomID, task.ParentTaskID,
+		task.CreatedAt, task.UpdatedAt)
+	return err
+}
+
+// GetTask 获取任务
+func (s *Storage) GetTask(taskID string) (*Task, error) {
+	query := `SELECT id, task_id, title, description, status, priority,
+	                 created_by, assigned_to, room_id, parent_task_id,
+	                 created_at, updated_at, completed_at
+	          FROM tasks WHERE task_id = ?`
+	row := s.db.QueryRow(query, taskID)
+
+	var t Task
+	var parentTaskID sql.NullString
+	var completedAt sql.NullInt64
+
+	err := row.Scan(&t.ID, &t.TaskID, &t.Title, &t.Description, &t.Status, &t.Priority,
+		&t.CreatedBy, &t.AssignedTo, &t.RoomID, &parentTaskID,
+		&t.CreatedAt, &t.UpdatedAt, &completedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if parentTaskID.Valid {
+		t.ParentTaskID = parentTaskID.String
+	}
+	if completedAt.Valid {
+		t.CompletedAt = completedAt.Int64
+	}
+	return &t, nil
+}
+
+// GetTasksByIDs 批量获取任务
+func (s *Storage) GetTasksByIDs(taskIDs []string) ([]Task, error) {
+	if len(taskIDs) == 0 {
+		return []Task{}, nil
+	}
+
+	// 构建 IN 子句
+	query := `SELECT id, task_id, title, description, status, priority,
+	                 created_by, assigned_to, room_id, parent_task_id,
+	                 created_at, updated_at, completed_at
+	          FROM tasks WHERE task_id IN (?`
+	args := make([]interface{}, len(taskIDs))
+	args[0] = taskIDs[0]
+	for i := 1; i < len(taskIDs); i++ {
+		query += ",?"
+		args[i] = taskIDs[i]
+	}
+	query += ")"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []Task
+	for rows.Next() {
+		var t Task
+		var parentTaskID sql.NullString
+		var completedAt sql.NullInt64
+
+		err := rows.Scan(&t.ID, &t.TaskID, &t.Title, &t.Description, &t.Status, &t.Priority,
+			&t.CreatedBy, &t.AssignedTo, &t.RoomID, &parentTaskID,
+			&t.CreatedAt, &t.UpdatedAt, &completedAt)
+		if err != nil {
+			return nil, err
+		}
+		if parentTaskID.Valid {
+			t.ParentTaskID = parentTaskID.String
+		}
+		if completedAt.Valid {
+			t.CompletedAt = completedAt.Int64
+		}
+		tasks = append(tasks, t)
+	}
+
+	return tasks, rows.Err()
+}
+
+// UpdateTask 更新任务
+func (s *Storage) UpdateTask(taskID string, req *UpdateTaskRequest) error {
+	query := `UPDATE tasks SET title = COALESCE(NULLIF(?, ''), title),
+	                           description = COALESCE(NULLIF(?, ''), description),
+	                           status = COALESCE(NULLIF(?, ''), status),
+	                           priority = CASE WHEN ? > 0 THEN ? ELSE priority END,
+	                           updated_at = ?
+	          WHERE task_id = ?`
+	now := time.Now().Unix()
+	_, err := s.db.Exec(query, req.Title, req.Description, req.Status, req.Priority, req.Priority, now, taskID)
+	return err
+}
+
+// DeleteTask 删除任务
+func (s *Storage) DeleteTask(taskID string) error {
+	query := `DELETE FROM tasks WHERE task_id = ?`
+	_, err := s.db.Exec(query, taskID)
+	return err
+}
+
+// GetTasksByRoom 获取聊天室的任务
+func (s *Storage) GetTasksByRoom(roomID string) ([]*Task, error) {
+	query := `SELECT id, task_id, title, description, status, priority,
+	                 created_by, assigned_to, room_id, parent_task_id,
+	                 created_at, updated_at, completed_at
+	          FROM tasks WHERE room_id = ? ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		var t Task
+		var parentTaskID sql.NullString
+		var completedAt sql.NullInt64
+
+		if err := rows.Scan(&t.ID, &t.TaskID, &t.Title, &t.Description, &t.Status, &t.Priority,
+			&t.CreatedBy, &t.AssignedTo, &t.RoomID, &parentTaskID,
+			&t.CreatedAt, &t.UpdatedAt, &completedAt); err != nil {
+			continue
+		}
+		if parentTaskID.Valid {
+			t.ParentTaskID = parentTaskID.String
+		}
+		if completedAt.Valid {
+			t.CompletedAt = completedAt.Int64
+		}
+		tasks = append(tasks, &t)
+	}
+	return tasks, rows.Err()
+}
+
+// GetTasksByAgent 获取 Agent 被分配的任务
+func (s *Storage) GetTasksByAgent(agentID string) ([]*Task, error) {
+	query := `SELECT id, task_id, title, description, status, priority,
+	                 created_by, assigned_to, room_id, parent_task_id,
+	                 created_at, updated_at, completed_at
+	          FROM tasks WHERE assigned_to = ? ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		var t Task
+		var parentTaskID sql.NullString
+		var completedAt sql.NullInt64
+
+		if err := rows.Scan(&t.ID, &t.TaskID, &t.Title, &t.Description, &t.Status, &t.Priority,
+			&t.CreatedBy, &t.AssignedTo, &t.RoomID, &parentTaskID,
+			&t.CreatedAt, &t.UpdatedAt, &completedAt); err != nil {
+			continue
+		}
+		if parentTaskID.Valid {
+			t.ParentTaskID = parentTaskID.String
+		}
+		if completedAt.Valid {
+			t.CompletedAt = completedAt.Int64
+		}
+		tasks = append(tasks, &t)
+	}
+	return tasks, rows.Err()
+}
+
+// ============ Focus Item 操作 ============
+
+// CreateFocusItem 创建关注点
+func (s *Storage) CreateFocusItem(item *FocusItem) error {
+	query := `
+		INSERT INTO focus_items (item_id, task_id, content, status, agent_id, room_id, item_order, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query,
+		item.ItemID, item.TaskID, item.Content, item.Status, item.AgentID, item.RoomID, item.ItemOrder,
+		item.CreatedAt, item.UpdatedAt)
+	return err
+}
+
+// GetFocusItemsByTask 获取任务的所有关注点
+func (s *Storage) GetFocusItemsByTask(taskID string) ([]*FocusItem, error) {
+	query := `SELECT id, item_id, task_id, content, status, agent_id, room_id, item_order, created_at, updated_at
+	          FROM focus_items WHERE task_id = ? ORDER BY item_order ASC`
+	rows, err := s.db.Query(query, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []*FocusItem
+	for rows.Next() {
+		var it FocusItem
+		if err := rows.Scan(&it.ID, &it.ItemID, &it.TaskID, &it.Content, &it.Status,
+			&it.AgentID, &it.RoomID, &it.ItemOrder, &it.CreatedAt, &it.UpdatedAt); err != nil {
+			continue
+		}
+		items = append(items, &it)
+	}
+	return items, rows.Err()
+}
+
+// UpdateFocusItem 更新关注点
+func (s *Storage) UpdateFocusItem(itemID string, req *UpdateFocusItemRequest) error {
+	query := `UPDATE focus_items SET content = COALESCE(NULLIF(?, ''), content),
+	                                status = COALESCE(NULLIF(?, ''), status),
+	                                updated_at = ?
+	          WHERE item_id = ?`
+	_, err := s.db.Exec(query, req.Content, req.Status, time.Now().Unix(), itemID)
+	return err
+}
+
+// DeleteFocusItem 删除关注点
+func (s *Storage) DeleteFocusItem(itemID string) error {
+	query := `DELETE FROM focus_items WHERE item_id = ?`
+	_, err := s.db.Exec(query, itemID)
+	return err
+}
+
+// ============ Permission 操作 ============
+
+// GetPermission 获取 Agent 权限
+func (s *Storage) GetPermission(agentID string) (*AgentPermission, error) {
+	query := `SELECT id, agent_id, level, allowed_tools, denied_tools,
+	                 daily_token_limit, monthly_token_limit, file_size_limit_mb, message_limit_per_hour,
+	                 created_at, updated_at
+	          FROM agent_permissions WHERE agent_id = ?`
+	row := s.db.QueryRow(query, agentID)
+
+	var p AgentPermission
+	var allowedTools, deniedTools sql.NullString
+
+	err := row.Scan(&p.ID, &p.AgentID, &p.Level, &allowedTools, &deniedTools,
+		&p.DailyTokenLimit, &p.MonthlyTokenLimit, &p.FileSizeLimitMB, &p.MessageLimitPerHour,
+		&p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if allowedTools.Valid {
+		p.AllowedTools = allowedTools.String
+	}
+	if deniedTools.Valid {
+		p.DeniedTools = deniedTools.String
+	}
+	return &p, nil
+}
+
+// UpsertPermission 创建或更新权限
+func (s *Storage) UpsertPermission(agentID string, req *UpsertPermissionRequest) error {
+	allowedToolsJSON := "[]"
+	if len(req.AllowedTools) > 0 {
+		data, _ := json.Marshal(req.AllowedTools)
+		allowedToolsJSON = string(data)
+	}
+	deniedToolsJSON := "[]"
+	if len(req.DeniedTools) > 0 {
+		data, _ := json.Marshal(req.DeniedTools)
+		deniedToolsJSON = string(data)
+	}
+
+	now := time.Now().Unix()
+	query := `
+		INSERT INTO agent_permissions (agent_id, level, allowed_tools, denied_tools,
+		                              daily_token_limit, monthly_token_limit, file_size_limit_mb, message_limit_per_hour,
+		                              created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			level = VALUES(level),
+			allowed_tools = VALUES(allowed_tools),
+			denied_tools = VALUES(denied_tools),
+			daily_token_limit = VALUES(daily_token_limit),
+			monthly_token_limit = VALUES(monthly_token_limit),
+			file_size_limit_mb = VALUES(file_size_limit_mb),
+			message_limit_per_hour = VALUES(message_limit_per_hour),
+			updated_at = VALUES(updated_at)
+	`
+	_, err := s.db.Exec(query, agentID, req.Level, allowedToolsJSON, deniedToolsJSON,
+		req.DailyTokenLimit, req.MonthlyTokenLimit, req.FileSizeLimitMB, req.MessageLimitPerHour,
+		now, now)
+	return err
+}
+
+// DeletePermission 删除权限
+func (s *Storage) DeletePermission(agentID string) error {
+	query := `DELETE FROM agent_permissions WHERE agent_id = ?`
+	_, err := s.db.Exec(query, agentID)
+	return err
+}
+
+// ============ FileTransfer 操作 ============
+
+// CreateFileTransfer 创建文件传输记录
+func (s *Storage) CreateFileTransfer(ft *FileTransfer) error {
+	query := `
+		INSERT INTO file_transfers (transfer_id, file_name, file_size, mime_type,
+		                            from_agent, to_agent, room_id, task_id, s3_key, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query,
+		ft.TransferID, ft.FileName, ft.FileSize, ft.MimeType,
+		ft.FromAgent, ft.ToAgent, ft.RoomID, ft.TaskID, ft.S3Key, ft.Status, ft.CreatedAt)
+	return err
+}
+
+// GetFileTransfer 获取文件传输记录
+func (s *Storage) GetFileTransfer(transferID string) (*FileTransfer, error) {
+	query := `SELECT id, transfer_id, file_name, file_size, mime_type,
+	                 from_agent, to_agent, room_id, task_id, s3_key, status, created_at, completed_at
+	          FROM file_transfers WHERE transfer_id = ?`
+	row := s.db.QueryRow(query, transferID)
+
+	var ft FileTransfer
+	var toAgent, taskID sql.NullString
+	var completedAt sql.NullInt64
+
+	err := row.Scan(&ft.ID, &ft.TransferID, &ft.FileName, &ft.FileSize, &ft.MimeType,
+		&ft.FromAgent, &toAgent, &ft.RoomID, &taskID, &ft.S3Key, &ft.Status, &ft.CreatedAt, &completedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if toAgent.Valid {
+		ft.ToAgent = toAgent.String
+	}
+	if taskID.Valid {
+		ft.TaskID = taskID.String
+	}
+	if completedAt.Valid {
+		ft.CompletedAt = completedAt.Int64
+	}
+	return &ft, nil
+}
+
+// UpdateFileTransferStatus 更新文件传输状态
+func (s *Storage) UpdateFileTransferStatus(transferID, status string) error {
+	query := `UPDATE file_transfers SET status = ?, completed_at = ? WHERE transfer_id = ?`
+	var completedAt interface{}
+	if status == "completed" || status == "failed" {
+		completedAt = time.Now().Unix()
+	}
+	_, err := s.db.Exec(query, status, completedAt, transferID)
+	return err
+}
+
+// GetFileTransfersByRoom 获取聊天室的文件传输记录
+func (s *Storage) GetFileTransfersByRoom(roomID string) ([]*FileTransfer, error) {
+	query := `SELECT id, transfer_id, file_name, file_size, mime_type,
+	                 from_agent, to_agent, room_id, task_id, s3_key, status, created_at, completed_at
+	          FROM file_transfers WHERE room_id = ? ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var transfers []*FileTransfer
+	for rows.Next() {
+		var ft FileTransfer
+		var toAgent, taskID sql.NullString
+		var completedAt sql.NullInt64
+
+		if err := rows.Scan(&ft.ID, &ft.TransferID, &ft.FileName, &ft.FileSize, &ft.MimeType,
+			&ft.FromAgent, &toAgent, &ft.RoomID, &taskID, &ft.S3Key, &ft.Status, &ft.CreatedAt, &completedAt); err != nil {
+			continue
+		}
+		if toAgent.Valid {
+			ft.ToAgent = toAgent.String
+		}
+		if taskID.Valid {
+			ft.TaskID = taskID.String
+		}
+		if completedAt.Valid {
+			ft.CompletedAt = completedAt.Int64
+		}
+		transfers = append(transfers, &ft)
+	}
+	return transfers, rows.Err()
+}
+
 // CreateUserRoomSession 创建用户房间会话（ws_established 初始为 false）
 // 返回会话 ID
 func (s *Storage) CreateUserRoomSession(userID, roomID, connectionID string) (int64, error) {
@@ -1051,4 +1453,194 @@ func (s *Storage) CleanupStaleSessions(maxAge time.Duration) error {
 	}
 
 	return nil
+}
+
+// ============ Agent 关系操作 ============
+
+// CreateRelation 创建关系
+func (s *Storage) CreateRelation(rel *AgentRelation) (int64, error) {
+	query := `
+		INSERT INTO agent_relations (agent_id, relation_type, related_agent_id, room_id, description, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+		ON DUPLICATE KEY UPDATE description = VALUES(description), updated_at = NOW()
+	`
+	result, err := s.db.Exec(query, rel.AgentID, rel.RelationType, rel.RelatedAgentID, rel.RoomID, rel.Description)
+	if err != nil {
+		return 0, err
+	}
+	id, _ := result.LastInsertId()
+	return id, nil
+}
+
+// GetAgentRelations 获取 Agent 的所有关系
+func (s *Storage) GetAgentRelations(agentID string, roomID string) ([]AgentRelation, error) {
+	query := `SELECT id, agent_id, relation_type, related_agent_id, room_id, description, created_at, updated_at
+	          FROM agent_relations WHERE agent_id = ?`
+	args := []interface{}{agentID}
+
+	if roomID != "" {
+		query += ` AND (room_id = ? OR room_id IS NULL OR room_id = '')`
+		args = append(args, roomID)
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		slog.Error("GetAgentRelations query failed", "error", err, "agent_id", agentID)
+		return nil, err
+	}
+	defer rows.Close()
+
+	relations := make([]AgentRelation, 0)
+	for rows.Next() {
+		var rel AgentRelation
+		var roomIDVal, descriptionVal sql.NullString
+		if err := rows.Scan(&rel.ID, &rel.AgentID, &rel.RelationType, &rel.RelatedAgentID, &roomIDVal, &descriptionVal, &rel.CreatedAt, &rel.UpdatedAt); err != nil {
+			slog.Warn("Scan error", "error", err)
+			continue
+		}
+		if roomIDVal.Valid {
+			rel.RoomID = roomIDVal.String
+		}
+		if descriptionVal.Valid {
+			rel.Description = descriptionVal.String
+		}
+		relations = append(relations, rel)
+		slog.Info("GetAgentRelations: found relation", "agent_id", rel.AgentID, "type", rel.RelationType)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("GetAgentRelations rows error", "error", err)
+	}
+	return relations, rows.Err()
+}
+
+// DeleteRelation 删除关系
+func (s *Storage) DeleteRelation(relationID int64) error {
+	query := `DELETE FROM agent_relations WHERE id = ?`
+	_, err := s.db.Exec(query, relationID)
+	return err
+}
+
+// GetRelationsSummary 获取 Agent 关系汇总
+func (s *Storage) GetRelationsSummary(agentID string, roomID string) (*Relations, error) {
+	relations, err := s.GetAgentRelations(agentID, roomID)
+	if err != nil {
+		return nil, err
+	}
+
+	summary := &Relations{
+		Colleagues:   []string{},
+		Superiors:    []string{},
+		Subordinates: []string{},
+	}
+
+	for _, rel := range relations {
+		switch rel.RelationType {
+		case RelationColleague:
+			summary.Colleagues = append(summary.Colleagues, rel.RelatedAgentID)
+		case RelationSuperior:
+			summary.Superiors = append(summary.Superiors, rel.RelatedAgentID)
+		case RelationSubordinate:
+			summary.Subordinates = append(summary.Subordinates, rel.RelatedAgentID)
+		}
+	}
+
+	return summary, nil
+}
+
+// GetRoomConfig 获取聊天室配置
+func (s *Storage) GetRoomConfig(roomID string) (*RoomConfig, error) {
+	query := `SELECT room_id, config FROM room_configs WHERE room_id = ?`
+	row := s.db.QueryRow(query, roomID)
+
+	var configRoomID string
+	var configJSON sql.NullString
+
+	err := row.Scan(&configRoomID, &configJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if !configJSON.Valid || configJSON.String == "" {
+		return nil, nil
+	}
+
+	var config RoomConfig
+	if err := json.Unmarshal([]byte(configJSON.String), &config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+// UpsertRoomConfig 创建或更新聊天室配置
+func (s *Storage) UpsertRoomConfig(config *RoomConfig) error {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	query := `
+		INSERT INTO room_configs (room_id, config) VALUES (?, ?)
+		ON DUPLICATE KEY UPDATE config = VALUES(config)
+	`
+	_, err = s.db.Exec(query, config.RoomID, string(configJSON))
+	return err
+}
+
+// GetAgentInfo 获取 Agent 信息
+func (s *Storage) GetAgentInfo(agentID string) (*AgentInfo, error) {
+	agent, err := s.GetAgent(agentID)
+	if err != nil || agent == nil {
+		return nil, err
+	}
+
+	info := &AgentInfo{
+		AgentID:  agent.AgentID,
+		Online:   agent.Status == "ONLINE",
+		Endpoint: agent.Endpoint,
+	}
+
+	// 获取 Agent 的 role 和 description（如果 agents 表有这些字段）
+	// 这里假设通过单独的查询或扩展 agents 表来获取
+
+	return info, nil
+}
+
+// GetRoomAgents 获取聊天室中的所有 Agent 成员及其关系
+func (s *Storage) GetRoomAgents(roomID string) ([]AgentInfo, error) {
+	members, err := s.GetRoomMembers(roomID)
+	if err != nil {
+		return nil, err
+	}
+
+	var agents []AgentInfo
+	for _, member := range members {
+		if member.MemberType != "agent" {
+			continue
+		}
+
+		agent, err := s.GetAgent(member.MemberID)
+		if err != nil || agent == nil {
+			continue
+		}
+
+		info := &AgentInfo{
+			AgentID:  agent.AgentID,
+			Online:   agent.Status == "ONLINE",
+			Endpoint: agent.Endpoint,
+		}
+
+		// 获取关系
+		relations, err := s.GetRelationsSummary(agent.AgentID, roomID)
+		if err == nil {
+			info.Relations = relations
+		}
+
+		agents = append(agents, *info)
+	}
+
+	return agents, nil
 }

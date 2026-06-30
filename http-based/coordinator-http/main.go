@@ -41,8 +41,14 @@ func main() {
 		log.Fatalf("初始化数据库失败: %v", err)
 	}
 
+	// 初始化 S3 客户端
+	s3Client, err := NewS3Client(cfg)
+	if err != nil {
+		log.Fatalf("初始化 S3 客户端失败: %v", err)
+	}
+
 	// 初始化处理器
-	h := NewHandler(storage, cfg)
+	h := NewHandler(storage, cfg, s3Client)
 
 	// 创建路由
 	router := mux.NewRouter()
@@ -67,6 +73,42 @@ func main() {
 	router.HandleFunc("/api/room/members", h.GetRoomMembersByQueryHandler).Methods("GET")    // 查询参数版本
 	router.HandleFunc("/api/room/{room_id}/members", h.GetRoomMembersHandler).Methods("GET") // 路径参数版本
 	router.HandleFunc("/api/room/{room_id}/leave/{member_id}", h.LeaveRoomHandler).Methods("DELETE")
+
+	// ============ Task API ============
+	router.HandleFunc("/api/task/create", h.CreateTaskHandler).Methods("POST")
+	router.HandleFunc("/api/task/{task_id}", h.GetTaskHandler).Methods("GET")
+	router.HandleFunc("/api/task/{task_id}", h.UpdateTaskHandler).Methods("PUT")
+	router.HandleFunc("/api/task/{task_id}", h.DeleteTaskHandler).Methods("DELETE")
+	router.HandleFunc("/api/room/{room_id}/tasks", h.GetTasksByRoomHandler).Methods("GET")
+	router.HandleFunc("/api/agent/{agent_id}/tasks", h.GetTasksByAgentHandler).Methods("GET")
+	router.HandleFunc("/api/tasks/batch", h.BatchGetTasksHandler).Methods("POST")
+
+	// ============ Focus Item API ============
+	router.HandleFunc("/api/task/{task_id}/focus", h.CreateFocusItemHandler).Methods("POST")
+	router.HandleFunc("/api/task/{task_id}/focus", h.GetFocusItemsHandler).Methods("GET")
+	router.HandleFunc("/api/focus/{item_id}", h.UpdateFocusItemHandler).Methods("PUT")
+	router.HandleFunc("/api/focus/{item_id}", h.DeleteFocusItemHandler).Methods("DELETE")
+
+	// ============ Permission API ============
+	router.HandleFunc("/api/agent/{agent_id}/permission", h.GetPermissionHandler).Methods("GET")
+	router.HandleFunc("/api/agent/{agent_id}/permission", h.UpsertPermissionHandler).Methods("PUT")
+	router.HandleFunc("/api/agent/{agent_id}/permission", h.DeletePermissionHandler).Methods("DELETE")
+	router.HandleFunc("/api/agent/{agent_id}/permission/check", h.CheckPermissionHandler).Methods("GET")
+
+	// ============ File Transfer API ============
+	router.HandleFunc("/api/file/upload-url", h.RequestUploadURLHandler).Methods("POST")
+	router.HandleFunc("/api/file/download-url", h.RequestDownloadURLHandler).Methods("GET")
+	router.HandleFunc("/api/file/confirm-upload/{transfer_id}", h.ConfirmUploadHandler).Methods("POST")
+	router.HandleFunc("/api/file/transfer", h.GetFileTransferHandler).Methods("GET")
+	router.HandleFunc("/api/room/{room_id}/files", h.GetRoomFileTransfersHandler).Methods("GET")
+
+	// ============ Agent 关系 API ============
+	router.HandleFunc("/api/agent/relation", h.CreateRelationHandler).Methods("POST")
+	router.HandleFunc("/api/agent/relations", h.GetAgentRelationsHandler).Methods("GET")
+	router.HandleFunc("/api/agent/relation/{id}", h.DeleteRelationHandler).Methods("DELETE")
+	router.HandleFunc("/api/agent/context", h.GetAgentContextHandler).Methods("GET")
+	router.HandleFunc("/api/room/{room_id}/agents", h.GetRoomAgentsHandler).Methods("GET")
+	router.HandleFunc("/api/room/{room_id}/config", h.UpdateRoomConfigHandler).Methods("PUT")
 
 	// ============ User WebSocket ============
 	router.HandleFunc("/ws/user", h.UserWSHandler)

@@ -7,5 +7,14 @@
   "db_name": "xclient",
   "heartbeat_timeout_sec": 60,
   "message_retention_days": 7,
-  "poll_batch_size": 50
+  "poll_batch_size": 50,
+  "log_level": "info",
+  "s3": {
+    "bucket": "x-client-files",
+    "region": "us-east-1",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "endpoint": "",
+    "presign_expiry_min": 30
+  }
 }

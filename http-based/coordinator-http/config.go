@@ -37,6 +37,19 @@ type Config struct {
 
 	// 日志级别配置
 	LogLevel string `json:"log_level"` // debug, info, warn, error
+
+	// S3 配置
+	S3 S3Config `json:"s3"`
+}
+
+// S3Config S3 配置
+type S3Config struct {
+	Bucket           string `json:"bucket"`
+	Region           string `json:"region"`
+	AccessKeyID      string `json:"access_key_id"`
+	SecretAccessKey  string `json:"secret_access_key"`
+	Endpoint         string `json:"endpoint"`           // 兼容 MinIO 等自建 S3
+	PresignExpiryMin int    `json:"presign_expiry_min"` // Presigned URL 过期时间（分钟）
 }
 
 var configPath string
@@ -108,6 +121,23 @@ func LoadConfig() (*Config, error) {
 		cfg.DBName = v
 	}
 
+	// S3 环境变量覆盖
+	if v := os.Getenv("S3_BUCKET"); v != "" {
+		cfg.S3.Bucket = v
+	}
+	if v := os.Getenv("S3_REGION"); v != "" {
+		cfg.S3.Region = v
+	}
+	if v := os.Getenv("S3_ACCESS_KEY_ID"); v != "" {
+		cfg.S3.AccessKeyID = v
+	}
+	if v := os.Getenv("S3_SECRET_ACCESS_KEY"); v != "" {
+		cfg.S3.SecretAccessKey = v
+	}
+	if v := os.Getenv("S3_ENDPOINT"); v != "" {
+		cfg.S3.Endpoint = v
+	}
+
 	return cfg, nil
 }
 
@@ -150,4 +180,17 @@ func (c *Config) GetMessageSendTimeout() time.Duration {
 		return 2 * time.Second
 	}
 	return time.Duration(c.MessageSendTimeoutMs) * time.Millisecond
+}
+
+// GetPresignExpiry 获取 Presigned URL 过期时间
+func (c *Config) GetPresignExpiry() time.Duration {
+	if c.S3.PresignExpiryMin <= 0 {
+		return 30 * time.Minute
+	}
+	return time.Duration(c.S3.PresignExpiryMin) * time.Minute
+}
+
+// IsS3Configured 检查 S3 是否已配置
+func (c *Config) IsS3Configured() bool {
+	return c.S3.Bucket != "" && c.S3.Region != "" && c.S3.AccessKeyID != "" && c.S3.SecretAccessKey != ""
 }

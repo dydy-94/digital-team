@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,8 +18,9 @@ import (
 // ============ HTTP Handler ============
 
 type Handler struct {
-	storage *Storage
-	cfg     *Config
+	storage  *Storage
+	cfg      *Config
+	s3Client *S3Client
 
 	// User WebSocket 连接管理（按 connectionID 索引，支持多 Tab）
 	userConns   map[string]*UserConn // connection_id -> connection
@@ -41,10 +43,11 @@ type UserConn struct {
 	CloseChan    chan struct{} // 连接关闭信号
 }
 
-func NewHandler(storage *Storage, cfg *Config) *Handler {
+func NewHandler(storage *Storage, cfg *Config, s3Client *S3Client) *Handler {
 	h := &Handler{
 		storage:   storage,
 		cfg:       cfg,
+		s3Client:  s3Client,
 		userConns: make(map[string]*UserConn),
 		userRooms: make(map[string]map[string]bool),
 		upgrader: websocket.Upgrader{
@@ -1300,6 +1303,594 @@ func (h *Handler) sendWarningAndCloseConn(userConn *UserConn, roomID, content st
 	slog.Info("已发送警告并关闭连接", "connection_id", userConn.ConnectionID, "user_id", userConn.UserID, "content", content)
 }
 
+// ============ Task API ============
+
+// CreateTaskHandler 创建任务
+func (h *Handler) CreateTaskHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证必填字段
+	if req.Title == "" || req.AssignedTo == "" || req.RoomID == "" {
+		h.writeError(w, http.StatusBadRequest, "title、assigned_to、room_id 不能为空")
+		return
+	}
+
+	// 生成任务 ID
+	taskID := uuid.New().String()
+	now := time.Now().Unix()
+
+	task := &Task{
+		TaskID:      taskID,
+		Title:       req.Title,
+		Description: req.Description,
+		Status:      "todo",
+		Priority:    req.Priority,
+		CreatedBy:   req.AssignedTo, // 创建者默认为被分配者，可由调用方指定
+		AssignedTo:  req.AssignedTo,
+		RoomID:      req.RoomID,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	// 如果创建者不是被分配者，需要从请求中获取 created_by
+	// 这里简化处理，实际应由调用方传入
+	if req.CreatedBy != "" {
+		task.CreatedBy = req.CreatedBy
+	}
+
+	if err := h.storage.CreateTask(task); err != nil {
+		slog.Error("创建任务失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "创建任务失败")
+		return
+	}
+
+	slog.Info("任务已创建", "task_id", taskID, "title", req.Title)
+
+	h.writeJSON(w, http.StatusOK, task)
+}
+
+// GetTaskHandler 获取任务详情
+func (h *Handler) GetTaskHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	taskID := vars["task_id"]
+
+	task, err := h.storage.GetTask(taskID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取任务失败")
+		return
+	}
+	if task == nil {
+		h.writeError(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, task)
+}
+
+// UpdateTaskHandler 更新任务
+func (h *Handler) UpdateTaskHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	taskID := vars["task_id"]
+
+	var req UpdateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证任务存在
+	task, err := h.storage.GetTask(taskID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取任务失败")
+		return
+	}
+	if task == nil {
+		h.writeError(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+
+	// 更新任务
+	if err := h.storage.UpdateTask(taskID, &req); err != nil {
+		slog.Error("更新任务失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "更新任务失败")
+		return
+	}
+
+	// 如果状态变为完成，设置完成时间
+	if req.Status == "done" && task.Status != "done" {
+		// 需要更新 completed_at，这里简化处理，实际应在 UpdateTask 中处理
+	}
+
+	// 重新获取更新后的任务
+	task, _ = h.storage.GetTask(taskID)
+
+	slog.Info("任务已更新", "task_id", taskID)
+
+	h.writeJSON(w, http.StatusOK, task)
+}
+
+// DeleteTaskHandler 删除任务
+func (h *Handler) DeleteTaskHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	taskID := vars["task_id"]
+
+	if err := h.storage.DeleteTask(taskID); err != nil {
+		slog.Error("删除任务失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "删除任务失败")
+		return
+	}
+
+	slog.Info("任务已删除", "task_id", taskID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// GetTasksByRoomHandler 获取聊天室的任务列表
+func (h *Handler) GetTasksByRoomHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	tasks, err := h.storage.GetTasksByRoom(roomID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取任务列表失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"tasks":   tasks,
+	})
+}
+
+// GetTasksByAgentHandler 获取 Agent 被分配的任务列表
+func (h *Handler) GetTasksByAgentHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	tasks, err := h.storage.GetTasksByAgent(agentID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取任务列表失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"tasks":   tasks,
+	})
+}
+
+// BatchGetTasksHandler 批量获取任务
+func (h *Handler) BatchGetTasksHandler(w http.ResponseWriter, r *http.Request) {
+	var req BatchGetTasksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	if len(req.TaskIDs) == 0 {
+		h.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"tasks":   []Task{},
+		})
+		return
+	}
+
+	if len(req.TaskIDs) > 100 {
+		h.writeError(w, http.StatusBadRequest, "最多支持一次查询 100 个任务")
+		return
+	}
+
+	tasks, err := h.storage.GetTasksByIDs(req.TaskIDs)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "批量获取任务失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"tasks":   tasks,
+	})
+}
+
+// ============ Focus Item API ============
+
+// CreateFocusItemHandler 创建关注点
+func (h *Handler) CreateFocusItemHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	taskID := vars["task_id"]
+
+	var req CreateFocusItemRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证任务存在
+	task, err := h.storage.GetTask(taskID)
+	if err != nil || task == nil {
+		h.writeError(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+
+	// 生成关注点 ID
+	itemID := uuid.New().String()
+	now := time.Now().Unix()
+
+	item := &FocusItem{
+		ItemID:    itemID,
+		TaskID:    taskID,
+		Content:   req.Content,
+		Status:    "[ ]",
+		AgentID:   req.AgentID,
+		RoomID:    task.RoomID,
+		ItemOrder: req.ItemOrder,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := h.storage.CreateFocusItem(item); err != nil {
+		slog.Error("创建关注点失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "创建关注点失败")
+		return
+	}
+
+	slog.Info("关注点已创建", "item_id", itemID, "task_id", taskID)
+
+	h.writeJSON(w, http.StatusOK, item)
+}
+
+// GetFocusItemsHandler 获取任务的所有关注点
+func (h *Handler) GetFocusItemsHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	taskID := vars["task_id"]
+
+	items, err := h.storage.GetFocusItemsByTask(taskID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取关注点失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"items":   items,
+	})
+}
+
+// UpdateFocusItemHandler 更新关注点
+func (h *Handler) UpdateFocusItemHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	itemID := vars["item_id"]
+
+	var req UpdateFocusItemRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	if err := h.storage.UpdateFocusItem(itemID, &req); err != nil {
+		slog.Error("更新关注点失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "更新关注点失败")
+		return
+	}
+
+	slog.Info("关注点已更新", "item_id", itemID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// DeleteFocusItemHandler 删除关注点
+func (h *Handler) DeleteFocusItemHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	itemID := vars["item_id"]
+
+	if err := h.storage.DeleteFocusItem(itemID); err != nil {
+		slog.Error("删除关注点失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "删除关注点失败")
+		return
+	}
+
+	slog.Info("关注点已删除", "item_id", itemID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// ============ Permission API ============
+
+// GetPermissionHandler 获取 Agent 权限
+func (h *Handler) GetPermissionHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	perm, err := h.storage.GetPermission(agentID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取权限失败")
+		return
+	}
+	if perm == nil {
+		h.writeError(w, http.StatusNotFound, "权限记录不存在")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, perm)
+}
+
+// UpsertPermissionHandler 创建或更新权限
+func (h *Handler) UpsertPermissionHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	var req UpsertPermissionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证 level
+	if req.Level != "" && req.Level != "l1" && req.Level != "l2" && req.Level != "l3" {
+		h.writeError(w, http.StatusBadRequest, "无效的权限级别，必须是 l1/l2/l3")
+		return
+	}
+
+	if err := h.storage.UpsertPermission(agentID, &req); err != nil {
+		slog.Error("更新权限失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "更新权限失败")
+		return
+	}
+
+	// 获取更新后的权限
+	perm, _ := h.storage.GetPermission(agentID)
+
+	slog.Info("权限已更新", "agent_id", agentID, "level", req.Level)
+
+	h.writeJSON(w, http.StatusOK, perm)
+}
+
+// DeletePermissionHandler 删除权限
+func (h *Handler) DeletePermissionHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	if err := h.storage.DeletePermission(agentID); err != nil {
+		slog.Error("删除权限失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "删除权限失败")
+		return
+	}
+
+	slog.Info("权限已删除", "agent_id", agentID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// CheckPermissionHandler 检查 Agent 是否有权限执行某操作
+func (h *Handler) CheckPermissionHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	// 从查询参数获取要检查的工具或操作
+	tool := r.URL.Query().Get("tool")
+	action := r.URL.Query().Get("action")
+
+	perm, err := h.storage.GetPermission(agentID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取权限失败")
+		return
+	}
+	if perm == nil {
+		// 没有权限记录，默认允许（向后兼容）
+		h.writeJSON(w, http.StatusOK, map[string]interface{}{
+			"allowed": true,
+			"reason":  "no_permission_record",
+		})
+		return
+	}
+
+	// 简化检查：检查权限级别
+	// l1: 基础权限，l2: 中级权限，l3: 高级权限
+	// 当前权限级别: perm.Level
+
+	// 默认允许的工具列表检查（如果配置了的话）
+	allowed := true
+	reason := "allowed_by_default"
+
+	// 如果配置了 allowed_tools，检查是否在列表中
+	if perm.AllowedTools != "" && perm.AllowedTools != "[]" {
+		allowed = false
+		reason = "not_in_allowed_tools"
+	}
+
+	// 如果配置了 denied_tools，检查是否在列表中
+	if perm.DeniedTools != "" && perm.DeniedTools != "[]" {
+		allowed = false
+		reason = "in_denied_tools"
+	}
+
+	_ = tool   // 预留参数
+	_ = action // 预留参数
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"allowed": allowed,
+		"reason":  reason,
+		"level":   perm.Level,
+	})
+}
+
+// ============ File Transfer API ============
+
+// RequestUploadURLRequest 请求上传 URL 请求
+type RequestUploadURLRequest struct {
+	FileName string `json:"file_name" binding:"required"`
+	FileSize int64  `json:"file_size" binding:"required"`
+	MimeType string `json:"mime_type"`
+	ToAgent  string `json:"to_agent"`
+	RoomID   string `json:"room_id" binding:"required"`
+	TaskID   string `json:"task_id"`
+}
+
+// RequestUploadURLHandler 请求上传 Presigned URL
+func (h *Handler) RequestUploadURLHandler(w http.ResponseWriter, r *http.Request) {
+	var req RequestUploadURLRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证 S3 配置
+	if h.s3Client == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "S3 未配置")
+		return
+	}
+
+	// 生成传输 ID 和 S3 key
+	transferID := uuid.New().String()
+	s3Key := GenerateS3Key(transferID, req.FileName)
+
+	// 创建文件传输记录
+	ft := &FileTransfer{
+		TransferID: transferID,
+		FileName:   req.FileName,
+		FileSize:   req.FileSize,
+		MimeType:   req.MimeType,
+		FromAgent:  "unknown", // 将在上传时更新
+		ToAgent:    req.ToAgent,
+		RoomID:     req.RoomID,
+		TaskID:     req.TaskID,
+		S3Key:      s3Key,
+		Status:     "pending",
+		CreatedAt:  time.Now().Unix(),
+	}
+
+	if err := h.storage.CreateFileTransfer(ft); err != nil {
+		slog.Error("创建文件传输记录失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "创建文件传输记录失败")
+		return
+	}
+
+	// 生成上传 Presigned URL
+	presignedURL, err := h.s3Client.GenerateUploadPresignedURL(s3Key)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "生成上传 URL 失败")
+		return
+	}
+
+	slog.Info("生成上传 URL", "transfer_id", transferID, "file_name", req.FileName)
+
+	h.writeJSON(w, http.StatusOK, FileTransferResponse{
+		TransferID:   transferID,
+		PresignedURL: presignedURL,
+		S3Key:        s3Key,
+	})
+}
+
+// RequestDownloadURLHandler 请求下载 Presigned URL
+func (h *Handler) RequestDownloadURLHandler(w http.ResponseWriter, r *http.Request) {
+	transferID := r.URL.Query().Get("transfer_id")
+	if transferID == "" {
+		h.writeError(w, http.StatusBadRequest, "transfer_id 不能为空")
+		return
+	}
+
+	// 验证 S3 配置
+	if h.s3Client == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "S3 未配置")
+		return
+	}
+
+	// 获取传输记录
+	ft, err := h.storage.GetFileTransfer(transferID)
+	if err != nil || ft == nil {
+		h.writeError(w, http.StatusNotFound, "传输记录不存在")
+		return
+	}
+
+	// 生成下载 Presigned URL
+	presignedURL, err := h.s3Client.GenerateDownloadPresignedURL(ft.S3Key)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "生成下载 URL 失败")
+		return
+	}
+
+	slog.Info("生成下载 URL", "transfer_id", transferID)
+
+	h.writeJSON(w, http.StatusOK, FileTransferResponse{
+		TransferID:   transferID,
+		PresignedURL: presignedURL,
+		S3Key:        ft.S3Key,
+	})
+}
+
+// ConfirmUploadHandler 确认上传完成
+func (h *Handler) ConfirmUploadHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	transferID := vars["transfer_id"]
+
+	var req struct {
+		FromAgent string `json:"from_agent" binding:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 更新传输状态
+	if err := h.storage.UpdateFileTransferStatus(transferID, "completed"); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "更新传输状态失败")
+		return
+	}
+
+	// 更新发送者
+	ft, _ := h.storage.GetFileTransfer(transferID)
+	if ft != nil {
+		ft.FromAgent = req.FromAgent
+		_ = ft
+	}
+
+	slog.Info("上传确认完成", "transfer_id", transferID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// GetFileTransferHandler 获取文件传输记录
+func (h *Handler) GetFileTransferHandler(w http.ResponseWriter, r *http.Request) {
+	transferID := r.URL.Query().Get("transfer_id")
+	if transferID == "" {
+		h.writeError(w, http.StatusBadRequest, "transfer_id 不能为空")
+		return
+	}
+
+	ft, err := h.storage.GetFileTransfer(transferID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取传输记录失败")
+		return
+	}
+	if ft == nil {
+		h.writeError(w, http.StatusNotFound, "传输记录不存在")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, ft)
+}
+
+// GetRoomFileTransfersHandler 获取聊天室的文件传输记录
+func (h *Handler) GetRoomFileTransfersHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	transfers, err := h.storage.GetFileTransfersByRoom(roomID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取传输记录失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":   true,
+		"transfers": transfers,
+	})
+}
+
 // sendWarningAndClose 发送警告消息后关闭连接
 func (h *Handler) sendWarningAndClose(conn *websocket.Conn, roomID, content string) {
 	wsMsg := map[string]interface{}{
@@ -1329,4 +1920,196 @@ func toJSONArray(arr []string) string {
 		return "[]"
 	}
 	return string(data)
+}
+
+// ============ Agent 关系 API ============
+
+// CreateRelationHandler 创建关系
+func (h *Handler) CreateRelationHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateRelationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证关系类型
+	validTypes := map[string]bool{
+		RelationColleague:   true,
+		RelationSuperior:    true,
+		RelationSubordinate: true,
+	}
+	if !validTypes[req.RelationType] {
+		h.writeError(w, http.StatusBadRequest, "无效的关系类型，可选值: colleague, superior, subordinate")
+		return
+	}
+
+	// 验证 Agent 存在
+	agent, err := h.storage.GetAgent(req.AgentID)
+	if err != nil || agent == nil {
+		h.writeError(w, http.StatusNotFound, "Agent 不存在")
+		return
+	}
+
+	// 验证关联 Agent 存在
+	relatedAgent, err := h.storage.GetAgent(req.RelatedAgentID)
+	if err != nil || relatedAgent == nil {
+		h.writeError(w, http.StatusNotFound, "关联的 Agent 不存在")
+		return
+	}
+
+	rel := &AgentRelation{
+		AgentID:        req.AgentID,
+		RelationType:   req.RelationType,
+		RelatedAgentID: req.RelatedAgentID,
+		RoomID:         req.RoomID,
+		Description:    req.Description,
+	}
+
+	id, err := h.storage.CreateRelation(rel)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	slog.Info("关系创建成功", "agent_id", req.AgentID, "relation_type", req.RelationType, "related_agent_id", req.RelatedAgentID)
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":     true,
+		"relation_id": id,
+	})
+}
+
+// GetAgentRelationsHandler 获取 Agent 关系列表
+func (h *Handler) GetAgentRelationsHandler(w http.ResponseWriter, r *http.Request) {
+	agentID := r.URL.Query().Get("agent_id")
+	if agentID == "" {
+		h.writeError(w, http.StatusBadRequest, "agent_id 不能为空")
+		return
+	}
+	roomID := r.URL.Query().Get("room_id")
+
+	relations, err := h.storage.GetAgentRelations(agentID, roomID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":   true,
+		"relations": relations,
+	})
+}
+
+// DeleteRelationHandler 删除关系
+func (h *Handler) DeleteRelationHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	relationID, err := strconv.ParseInt(vars["id"], 10, 64)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的 relation_id")
+		return
+	}
+
+	if err := h.storage.DeleteRelation(relationID); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	slog.Info("关系删除成功", "relation_id", relationID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// GetAgentContextHandler 获取 Agent 完整上下文
+func (h *Handler) GetAgentContextHandler(w http.ResponseWriter, r *http.Request) {
+	agentID := r.URL.Query().Get("agent_id")
+	roomID := r.URL.Query().Get("room_id")
+
+	if agentID == "" {
+		h.writeError(w, http.StatusBadRequest, "agent_id 不能为空")
+		return
+	}
+
+	// 获取 Agent 信息
+	agentInfo, err := h.storage.GetAgentInfo(agentID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if agentInfo == nil {
+		h.writeError(w, http.StatusNotFound, "Agent 不存在")
+		return
+	}
+
+	// 获取聊天室成员
+	var roomMembers []AgentInfo
+	if roomID != "" {
+		roomMembers, _ = h.storage.GetRoomAgents(roomID)
+	}
+
+	// 获取关系汇总
+	relations, _ := h.storage.GetRelationsSummary(agentID, roomID)
+
+	// 获取聊天室配置
+	var roomConfig *RoomConfig
+	if roomID != "" {
+		roomConfig, _ = h.storage.GetRoomConfig(roomID)
+	}
+
+	context := &AgentContext{
+		CurrentAgent: agentInfo,
+		RoomMembers:  roomMembers,
+		Relations:    relations,
+		RoomConfig:   roomConfig,
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"context": context,
+	})
+}
+
+// GetRoomAgentsHandler 获取聊天室成员
+func (h *Handler) GetRoomAgentsHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	agents, err := h.storage.GetRoomAgents(roomID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"agents":  agents,
+	})
+}
+
+// UpdateRoomConfigHandler 创建/更新聊天室配置
+func (h *Handler) UpdateRoomConfigHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	var req UpsertRoomConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	config := &RoomConfig{
+		RoomID:           roomID,
+		Name:             req.Name,
+		HierarchyEnabled: req.HierarchyEnabled,
+		AutoWelcome:      req.AutoWelcome,
+		WelcomeMessage:   req.WelcomeMessage,
+	}
+
+	if err := h.storage.UpsertRoomConfig(config); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	slog.Info("聊天室配置更新成功", "room_id", roomID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }

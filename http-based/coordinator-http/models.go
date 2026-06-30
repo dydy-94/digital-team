@@ -211,3 +211,204 @@ type WSMessage struct {
 	Type string      `json:"type"` // message / history / error / system
 	Data interface{} `json:"data"`
 }
+
+// ============ Task 模型 ============
+
+// Task 任务
+type Task struct {
+	ID           int64  `json:"-" db:"id"`
+	TaskID       string `json:"task_id" db:"task_id"`
+	Title        string `json:"title" db:"title"`
+	Description  string `json:"description" db:"description"`
+	Status       string `json:"status" db:"status"` // todo / in_progress / done
+	Priority     int    `json:"priority" db:"priority"`
+	CreatedBy    string `json:"created_by" db:"created_by"`
+	AssignedTo   string `json:"assigned_to" db:"assigned_to"`
+	RoomID       string `json:"room_id" db:"room_id"`
+	ParentTaskID string `json:"parent_task_id,omitempty" db:"parent_task_id"`
+	CreatedAt    int64  `json:"created_at" db:"created_at"`
+	UpdatedAt    int64  `json:"updated_at" db:"updated_at"`
+	CompletedAt  int64  `json:"completed_at,omitempty" db:"completed_at"`
+}
+
+// FocusItem 任务关注点
+type FocusItem struct {
+	ID        int64  `json:"-" db:"id"`
+	ItemID    string `json:"item_id" db:"item_id"`
+	TaskID    string `json:"task_id" db:"task_id"`
+	Content   string `json:"content" db:"content"`
+	Status    string `json:"status" db:"status"` // [ ] / [/] / [x]
+	AgentID   string `json:"agent_id" db:"agent_id"`
+	RoomID    string `json:"room_id" db:"room_id"`
+	ItemOrder int    `json:"item_order" db:"item_order"`
+	CreatedAt int64  `json:"created_at" db:"created_at"`
+	UpdatedAt int64  `json:"updated_at" db:"updated_at"`
+}
+
+// AgentPermission Agent 权限
+type AgentPermission struct {
+	ID                  int64  `json:"-" db:"id"`
+	AgentID             string `json:"agent_id" db:"agent_id"`
+	Level               string `json:"level" db:"level"`                 // l1 / l2 / l3
+	AllowedTools        string `json:"allowed_tools" db:"allowed_tools"` // JSON array
+	DeniedTools         string `json:"denied_tools" db:"denied_tools"`   // JSON array
+	DailyTokenLimit     int64  `json:"daily_token_limit" db:"daily_token_limit"`
+	MonthlyTokenLimit   int64  `json:"monthly_token_limit" db:"monthly_token_limit"`
+	FileSizeLimitMB     int    `json:"file_size_limit_mb" db:"file_size_limit_mb"`
+	MessageLimitPerHour int    `json:"message_limit_per_hour" db:"message_limit_per_hour"`
+	CreatedAt           int64  `json:"created_at" db:"created_at"`
+	UpdatedAt           int64  `json:"updated_at" db:"updated_at"`
+}
+
+// FileTransfer 文件传输记录
+type FileTransfer struct {
+	ID          int64  `json:"-" db:"id"`
+	TransferID  string `json:"transfer_id" db:"transfer_id"`
+	FileName    string `json:"file_name" db:"file_name"`
+	FileSize    int64  `json:"file_size" db:"file_size"`
+	MimeType    string `json:"mime_type" db:"mime_type"`
+	FromAgent   string `json:"from_agent" db:"from_agent"`
+	ToAgent     string `json:"to_agent" db:"to_agent"`
+	RoomID      string `json:"room_id" db:"room_id"`
+	TaskID      string `json:"task_id,omitempty" db:"task_id"`
+	S3Key       string `json:"s3_key" db:"s3_key"`
+	Status      string `json:"status" db:"status"` // pending / uploading / completed / failed
+	CreatedAt   int64  `json:"created_at" db:"created_at"`
+	CompletedAt int64  `json:"completed_at,omitempty" db:"completed_at"`
+}
+
+// ============ Task API 请求/响应模型 ============
+
+// CreateTaskRequest 创建任务请求
+type CreateTaskRequest struct {
+	Title        string `json:"title" binding:"required"`
+	Description  string `json:"description"`
+	Priority     int    `json:"priority"`
+	AssignedTo   string `json:"assigned_to" binding:"required"`
+	RoomID       string `json:"room_id" binding:"required"`
+	ParentTaskID string `json:"parent_task_id"`
+	CreatedBy    string `json:"created_by"`
+}
+
+// UpdateTaskRequest 更新任务请求
+type UpdateTaskRequest struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Status      string `json:"status"` // todo / in_progress / done
+	Priority    int    `json:"priority"`
+}
+
+// BatchGetTasksRequest 批量获取任务请求
+type BatchGetTasksRequest struct {
+	TaskIDs []string `json:"task_ids" binding:"required"`
+}
+
+// BatchGetTasksResponse 批量获取任务响应
+type BatchGetTasksResponse struct {
+	Tasks []Task `json:"tasks"`
+}
+
+// CreateFocusItemRequest 创建关注点请求
+type CreateFocusItemRequest struct {
+	Content   string `json:"content" binding:"required"`
+	AgentID   string `json:"agent_id" binding:"required"`
+	ItemOrder int    `json:"item_order"`
+}
+
+// UpdateFocusItemRequest 更新关注点请求
+type UpdateFocusItemRequest struct {
+	Content string `json:"content"`
+	Status  string `json:"status"` // [ ] / [/] / [x]
+}
+
+// UpsertPermissionRequest 创建/更新权限请求
+type UpsertPermissionRequest struct {
+	Level               string   `json:"level"` // l1 / l2 / l3
+	AllowedTools        []string `json:"allowed_tools"`
+	DeniedTools         []string `json:"denied_tools"`
+	DailyTokenLimit     int64    `json:"daily_token_limit"`
+	MonthlyTokenLimit   int64    `json:"monthly_token_limit"`
+	FileSizeLimitMB     int      `json:"file_size_limit_mb"`
+	MessageLimitPerHour int      `json:"message_limit_per_hour"`
+}
+
+// FileTransferResponse 文件传输响应
+type FileTransferResponse struct {
+	TransferID   string `json:"transfer_id"`
+	PresignedURL string `json:"presigned_url,omitempty"`
+	S3Key        string `json:"s3_key"`
+}
+
+// ============ Agent 关系模型 ============
+
+// RelationType 关系类型常量
+const (
+	RelationColleague   = "colleague"
+	RelationSuperior    = "superior"
+	RelationSubordinate = "subordinate"
+)
+
+// AgentRelation Agent 关系
+type AgentRelation struct {
+	ID             int64     `json:"id" db:"id"`
+	AgentID        string    `json:"agent_id" db:"agent_id"`
+	RelationType   string    `json:"relation_type" db:"relation_type"` // colleague / superior / subordinate
+	RelatedAgentID string    `json:"related_agent_id" db:"related_agent_id"`
+	RoomID         string    `json:"room_id,omitempty" db:"room_id"`
+	Description    string    `json:"description,omitempty" db:"description"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// RoomConfig 聊天室配置
+type RoomConfig struct {
+	RoomID           string `json:"room_id" db:"room_id"`
+	Name             string `json:"name"`
+	HierarchyEnabled bool   `json:"hierarchy_enabled"`
+	AutoWelcome      bool   `json:"auto_welcome"`
+	WelcomeMessage   string `json:"welcome_message"`
+}
+
+// Relations Agent 关系汇总
+type Relations struct {
+	Colleagues   []string `json:"colleagues"`
+	Superiors    []string `json:"superiors"`
+	Subordinates []string `json:"subordinates"`
+}
+
+// AgentContext Agent 完整上下文
+type AgentContext struct {
+	CurrentAgent *AgentInfo  `json:"current_agent"`
+	RoomMembers  []AgentInfo `json:"room_members"`
+	Relations    *Relations  `json:"relations"`
+	RoomConfig   *RoomConfig `json:"room_config,omitempty"`
+}
+
+// AgentInfo Agent 信息（用于 API 响应）
+type AgentInfo struct {
+	AgentID     string     `json:"agent_id"`
+	Role        string     `json:"role,omitempty"`
+	Description string     `json:"description,omitempty"`
+	Online      bool       `json:"online,omitempty"`
+	Relations   *Relations `json:"relations,omitempty"`
+	Endpoint    string     `json:"endpoint,omitempty"`
+}
+
+// ============ Agent 关系 API 请求/响应模型 ============
+
+// CreateRelationRequest 创建关系请求
+type CreateRelationRequest struct {
+	AgentID        string `json:"agent_id" binding:"required"`
+	RelationType   string `json:"relation_type" binding:"required"` // colleague / superior / subordinate
+	RelatedAgentID string `json:"related_agent_id" binding:"required"`
+	RoomID         string `json:"room_id"`
+	Description    string `json:"description"`
+}
+
+// UpsertRoomConfigRequest 创建/更新聊天室配置请求
+type UpsertRoomConfigRequest struct {
+	Name             string `json:"name"`
+	HierarchyEnabled bool   `json:"hierarchy_enabled"`
+	AutoWelcome      bool   `json:"auto_welcome"`
+	WelcomeMessage   string `json:"welcome_message"`
+}
