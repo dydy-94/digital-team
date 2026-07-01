@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -80,13 +81,13 @@ func (h *Handler) RegisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.storage.RegisterAgent(req.AgentID, req.Endpoint); err != nil {
+	if err := h.storage.RegisterAgent(req.AgentID, req.Endpoint, req.CallbackURL); err != nil {
 		slog.Error("注册 Agent 失败", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "注册失败")
 		return
 	}
 
-	slog.Info("Agent 注册成功", "agent_id", req.AgentID, "endpoint", req.Endpoint)
+	slog.Info("Agent 注册成功", "agent_id", req.AgentID, "endpoint", req.Endpoint, "callback_url", req.CallbackURL)
 
 	h.writeJSON(w, http.StatusOK, RegisterResponse{
 		Success: true,
@@ -228,10 +229,58 @@ func (h *Handler) SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("消息已保存", "msg_id", msgID, "room", req.RoomID, "sender", req.SenderID)
 
+	// A2A 主动推送：如果消息提到了某个 Agent 且该 Agent 有回调 URL，则主动推送
+	if len(req.MentionUsers) > 0 {
+		go h.notifyMentionedAgents(req.MentionUsers, msg)
+	}
+
 	h.writeJSON(w, http.StatusOK, SendMessageResponse{
 		Success: true,
 		MsgID:   msgID,
 	})
+}
+
+// notifyMentionedAgents 通知被提及的 Agent（有回调 URL 的立即推送）
+func (h *Handler) notifyMentionedAgents(mentionedAgents []string, msg *Message) {
+	for _, agentID := range mentionedAgents {
+		agent, err := h.storage.GetAgent(agentID)
+		if err != nil || agent == nil {
+			continue
+		}
+		if agent.CallbackURL == "" {
+			// 没有回调 URL，跳过
+			continue
+		}
+
+		// 主动推送消息到 Agent 的回调 URL
+		callbackReq := CallbackRequest{
+			Type:      "new_message",
+			FromAgent: msg.SenderID,
+			RoomID:    msg.RoomID,
+			MsgID:     msg.MsgID,
+			Content:   msg.Content,
+			Intent:    msg.Intent,
+		}
+
+		body, _ := json.Marshal(callbackReq)
+		resp, err := http.Post(agent.CallbackURL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			slog.Warn("A2A 回调推送失败", "agent_id", agentID, "callback_url", agent.CallbackURL, "error", err)
+		} else {
+			resp.Body.Close()
+			slog.Info("A2A 回调推送成功", "agent_id", agentID, "msg_id", msg.MsgID)
+		}
+	}
+}
+
+// CallbackRequest A2A 回调请求
+type CallbackRequest struct {
+	Type      string `json:"type"`
+	FromAgent string `json:"from_agent"`
+	RoomID    string `json:"room_id"`
+	MsgID     string `json:"msg_id"`
+	Content   string `json:"content"`
+	Intent    string `json:"intent"`
 }
 
 // ============ User API ============
@@ -408,6 +457,24 @@ func (h *Handler) GetRoomsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GetRoomHandler 获取单个聊天室详情
+func (h *Handler) GetRoomHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	room, err := h.storage.GetRoom(roomID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取聊天室失败")
+		return
+	}
+	if room == nil {
+		h.writeError(w, http.StatusNotFound, "聊天室不存在")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, room)
+}
+
 // JoinRoomHandler 加入聊天室
 // 逻辑：
 // 1. 检查用户是否已有 ws_established=true 的会话 -> 返回错误
@@ -479,6 +546,32 @@ func (h *Handler) LeaveRoomHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("成员离开聊天室", "room_id", roomID, "member_id", memberID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// DeleteRoomHandler 删除聊天室
+func (h *Handler) DeleteRoomHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	roomID := vars["room_id"]
+
+	// 1. 检查聊天室是否存在
+	room, err := h.storage.GetRoom(roomID)
+	if err != nil || room == nil {
+		h.writeError(w, http.StatusNotFound, "聊天室不存在")
+		return
+	}
+
+	// 2. 删除聊天室
+	if err := h.storage.DeleteRoom(roomID); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "删除聊天室失败")
+		return
+	}
+
+	// 3. 使关联的触发器失效
+	h.storage.InvalidateTriggersByRoom(roomID, "room_deleted")
+
+	slog.Info("聊天室已删除", "room_id", roomID)
 
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
@@ -1303,6 +1396,30 @@ func (h *Handler) sendWarningAndCloseConn(userConn *UserConn, roomID, content st
 	slog.Info("已发送警告并关闭连接", "connection_id", userConn.ConnectionID, "user_id", userConn.UserID, "content", content)
 }
 
+// broadcastToRoom 向聊天室的所有成员广播消息
+func (h *Handler) broadcastToRoom(roomID string, msg *Message) {
+	wsMsg := h.messageToWSData(msg)
+	data, _ := json.Marshal(map[string]interface{}{
+		"type": "message",
+		"data": wsMsg,
+	})
+
+	h.userConnsMu.RLock()
+	for _, conn := range h.userConns {
+		conn.RoomsMu.RLock()
+		inRoom := conn.Rooms[roomID]
+		conn.RoomsMu.RUnlock()
+		if inRoom {
+			select {
+			case conn.Send <- data:
+			default:
+				// 缓冲区满，跳过
+			}
+		}
+	}
+	h.userConnsMu.RUnlock()
+}
+
 // ============ Task API ============
 
 // CreateTaskHandler 创建任务
@@ -1443,6 +1560,20 @@ func (h *Handler) GetTasksByRoomHandler(w http.ResponseWriter, r *http.Request) 
 	h.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"tasks":   tasks,
+	})
+}
+
+// ListAgentsHandler 获取所有 Agent 列表
+func (h *Handler) ListAgentsHandler(w http.ResponseWriter, r *http.Request) {
+	agents, err := h.storage.ListAgents()
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取 Agent 列表失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"agents":  agents,
 	})
 }
 
@@ -2110,6 +2241,378 @@ func (h *Handler) UpdateRoomConfigHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	slog.Info("聊天室配置更新成功", "room_id", roomID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// ============ Agent 模板 API ============
+
+// GetTemplateHandler 获取 Agent 模板
+func (h *Handler) GetTemplateHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	template, err := h.storage.GetTemplate(agentID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, GetTemplateResponse{
+		Success:  true,
+		Template: template,
+	})
+}
+
+// UpdateTemplateHandler 更新 Agent 模板
+func (h *Handler) UpdateTemplateHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	var req UpdateTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 获取现有模板（如果存在）
+	existing, _ := h.storage.GetTemplate(agentID)
+
+	template := &AgentTemplate{
+		AgentID:   agentID,
+		Soul:      req.Soul,
+		Bootstrap: req.Bootstrap,
+		Meta:      req.Meta,
+	}
+
+	// 保留现有值的某些字段（如果请求中未提供）
+	if existing != nil {
+		if template.Soul == nil {
+			template.Soul = existing.Soul
+		}
+		if template.Bootstrap == nil {
+			template.Bootstrap = existing.Bootstrap
+		}
+		if template.Meta == nil {
+			template.Meta = existing.Meta
+		}
+	}
+
+	if err := h.storage.SaveTemplate(agentID, template); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	slog.Info("Agent 模板更新成功", "agent_id", agentID)
+
+	h.writeJSON(w, http.StatusOK, GetTemplateResponse{
+		Success:  true,
+		Template: template,
+	})
+}
+
+// DeleteTemplateHandler 删除 Agent 模板
+func (h *Handler) DeleteTemplateHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	agentID := vars["agent_id"]
+
+	if err := h.storage.DeleteTemplate(agentID); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	slog.Info("Agent 模板删除成功", "agent_id", agentID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// ============ Trigger 触发器 API ============
+
+// CreateTriggerHandler 创建触发器
+func (h *Handler) CreateTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateTriggerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 验证聊天室是否存在
+	room, err := h.storage.GetRoom(req.RoomID)
+	if err != nil || room == nil {
+		h.writeError(w, http.StatusBadRequest, "聊天室不存在")
+		return
+	}
+
+	// 生成触发器 ID
+	triggerID := fmt.Sprintf("trig_%s", uuid.New().String())
+	now := time.Now().UnixMilli()
+
+	trigger := &Trigger{
+		ID:              triggerID,
+		XClientID:       req.XClientID,
+		Name:            req.Name,
+		Type:            req.Type,
+		Config:          req.Config,
+		Reason:          req.Reason,
+		RoomID:          req.RoomID,
+		RoomValid:       true,
+		Status:          "enabled",
+		FireCount:       0,
+		CooldownSeconds: req.CooldownSeconds,
+		MaxFires:        req.MaxFires,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	if err := h.storage.CreateTrigger(trigger); err != nil {
+		slog.Error("创建触发器失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "创建触发器失败")
+		return
+	}
+
+	slog.Info("触发器创建成功", "trigger_id", triggerID, "name", req.Name, "room_id", req.RoomID)
+
+	h.writeJSON(w, http.StatusOK, TriggerResponse{
+		Success:   true,
+		TriggerID: triggerID,
+	})
+}
+
+// GetTriggerHandler 获取触发器详情
+func (h *Handler) GetTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	triggerID := vars["id"]
+
+	trigger, err := h.storage.GetTrigger(triggerID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取触发器失败")
+		return
+	}
+	if trigger == nil {
+		h.writeError(w, http.StatusNotFound, "触发器不存在")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, trigger)
+}
+
+// ListTriggersHandler 获取触发器列表
+func (h *Handler) ListTriggersHandler(w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("room_id")
+	status := r.URL.Query().Get("status")
+
+	triggers, err := h.storage.GetTriggers(roomID, status)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取触发器列表失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, TriggerListResponse{
+		Success:  true,
+		Triggers: triggers,
+	})
+}
+
+// UpdateTriggerHandler 更新触发器
+func (h *Handler) UpdateTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	triggerID := vars["id"]
+
+	var req UpdateTriggerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 获取现有触发器
+	trigger, err := h.storage.GetTrigger(triggerID)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取触发器失败")
+		return
+	}
+	if trigger == nil {
+		h.writeError(w, http.StatusNotFound, "触发器不存在")
+		return
+	}
+
+	// 更新字段
+	if req.Name != nil {
+		trigger.Name = *req.Name
+	}
+	if req.Config != nil {
+		trigger.Config = *req.Config
+	}
+	if req.Reason != nil {
+		trigger.Reason = *req.Reason
+	}
+	if req.RoomID != nil {
+		// 验证新聊天室是否存在
+		room, err := h.storage.GetRoom(*req.RoomID)
+		if err != nil || room == nil {
+			h.writeError(w, http.StatusBadRequest, "聊天室不存在")
+			return
+		}
+		trigger.RoomID = *req.RoomID
+		trigger.RoomValid = true
+		trigger.Status = "enabled"
+	}
+	if req.IsEnabled != nil {
+		if *req.IsEnabled {
+			if trigger.Status == "disabled" {
+				trigger.Status = "enabled"
+			}
+		} else {
+			trigger.Status = "disabled"
+		}
+	}
+	if req.MaxFires != nil {
+		trigger.MaxFires = req.MaxFires
+	}
+	if req.CooldownSeconds != nil {
+		trigger.CooldownSeconds = *req.CooldownSeconds
+	}
+	trigger.UpdatedAt = time.Now().UnixMilli()
+
+	if err := h.storage.UpdateTrigger(trigger); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "更新触发器失败")
+		return
+	}
+
+	slog.Info("触发器更新成功", "trigger_id", triggerID)
+
+	h.writeJSON(w, http.StatusOK, TriggerResponse{Success: true})
+}
+
+// DeleteTriggerHandler 删除触发器
+func (h *Handler) DeleteTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	triggerID := vars["id"]
+
+	if err := h.storage.DeleteTrigger(triggerID); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "删除触发器失败")
+		return
+	}
+
+	slog.Info("触发器删除成功", "trigger_id", triggerID)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// TriggerNotifyHandler 处理触发器触发通知
+func (h *Handler) TriggerNotifyHandler(w http.ResponseWriter, r *http.Request) {
+	var req TriggerNotifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 获取触发器信息
+	trigger, err := h.storage.GetTrigger(req.TriggerID)
+	if err != nil || trigger == nil {
+		h.writeError(w, http.StatusNotFound, "触发器不存在")
+		return
+	}
+
+	// 检查触发器状态
+	if trigger.Status != "enabled" || !trigger.RoomValid {
+		h.writeError(w, http.StatusBadRequest, "触发器未启用或已失效")
+		return
+	}
+
+	// 检查冷却时间
+	if trigger.CooldownSeconds > 0 {
+		elapsed := time.Now().UnixMilli() - trigger.LastFiredAt
+		if elapsed < int64(trigger.CooldownSeconds*1000) {
+			h.writeError(w, http.StatusBadRequest, "触发器在冷却中")
+			return
+		}
+	}
+
+	// 生成消息 ID
+	msgID := uuid.New().String()
+	now := time.Now()
+
+	// 构造触发消息
+	msg := &Message{
+		MsgID:      msgID,
+		RoomID:     trigger.RoomID,
+		SenderID:   "system",
+		SenderType: "system",
+		Content:    fmt.Sprintf("[触发器] %s 已触发: %s", trigger.Name, trigger.Reason),
+		Intent:     "TRIGGER",
+		TargetID:   "all",
+		CreatedAt:  now,
+	}
+
+	// 保存消息
+	if err := h.storage.SaveMessage(msg); err != nil {
+		slog.Error("保存触发消息失败", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "保存消息失败")
+		return
+	}
+
+	// 广播到聊天室
+	h.broadcastToRoom(trigger.RoomID, msg)
+
+	// 更新触发器状态
+	h.storage.UpdateTriggerFired(trigger.ID, now.UnixMilli())
+
+	slog.Info("触发器已触发", "trigger_id", trigger.ID, "name", trigger.Name, "room_id", trigger.RoomID)
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"msg_id":  msgID,
+	})
+}
+
+// InvalidateTriggerHandler 使触发器失效
+func (h *Handler) InvalidateTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	triggerID := vars["id"]
+
+	var req TriggerInvalidateRequest
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if err := h.storage.InvalidateTrigger(triggerID, req.Reason); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "使触发器失效失败")
+		return
+	}
+
+	slog.Info("触发器已失效", "trigger_id", triggerID, "reason", req.Reason)
+
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+// GetTriggerExecutionsHandler 获取触发器执行记录
+func (h *Handler) GetTriggerExecutionsHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	triggerID := vars["id"]
+	limit := 50
+
+	execs, err := h.storage.GetTriggerExecutions(triggerID, limit)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "获取执行记录失败")
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success":    true,
+		"executions": execs,
+	})
+}
+
+// RoomDeletedHandler 聊天室删除通知（被 X-Client 调用）
+func (h *Handler) RoomDeletedHandler(w http.ResponseWriter, r *http.Request) {
+	var req RoomDeletedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "无效的请求体")
+		return
+	}
+
+	// 使该聊天室关联的触发器失效
+	h.storage.InvalidateTriggersByRoom(req.RoomID, "room_deleted")
+
+	slog.Info("聊天室删除通知已处理", "room_id", req.RoomID)
 
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }

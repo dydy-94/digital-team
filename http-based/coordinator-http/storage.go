@@ -21,6 +21,10 @@ type Storage struct {
 	// 聊天室成员缓存（内存加速查询）
 	memberMu sync.RWMutex
 	members  map[string]map[string]*Member // room_id -> member_id -> Member
+
+	// Agent 模板缓存
+	templateMu sync.RWMutex
+	templates  map[string]*AgentTemplate // agent_id -> AgentTemplate
 }
 
 func NewStorage(cfg *Config) (*Storage, error) {
@@ -39,9 +43,10 @@ func NewStorage(cfg *Config) (*Storage, error) {
 	}
 
 	s := &Storage{
-		db:      db,
-		cfg:     cfg,
-		members: make(map[string]map[string]*Member),
+		db:        db,
+		cfg:       cfg,
+		members:   make(map[string]map[string]*Member),
+		templates: make(map[string]*AgentTemplate),
 	}
 
 	// 创建用户会话表
@@ -49,9 +54,19 @@ func NewStorage(cfg *Config) (*Storage, error) {
 		slog.Error("创建 user_room_sessions 表失败", "error", err)
 	}
 
+	// 创建 Agent 模板表
+	if err := s.createAgentTemplatesTable(); err != nil {
+		slog.Error("创建 agent_templates 表失败", "error", err)
+	}
+
 	// 初始化加载聊天室成员到内存
 	if err := s.loadMembersToMemory(); err != nil {
 		slog.Error("加载聊天室成员到内存失败", "error", err)
+	}
+
+	// 初始化加载模板到内存
+	if err := s.loadTemplatesToMemory(); err != nil {
+		slog.Error("加载模板到内存失败", "error", err)
 	}
 
 	// 启动定期清理任务
@@ -67,16 +82,17 @@ func (s *Storage) Close() error {
 // ============ Agent 操作 ============
 
 // RegisterAgent 注册或更新 Agent
-func (s *Storage) RegisterAgent(agentID, endpoint string) error {
+func (s *Storage) RegisterAgent(agentID, endpoint, callbackURL string) error {
 	query := `
-		INSERT INTO agents (agent_id, endpoint, status, last_heartbeat)
-		VALUES (?, ?, 'ONLINE', NOW())
+		INSERT INTO agents (agent_id, endpoint, callback_url, status, last_heartbeat)
+		VALUES (?, ?, ?, 'ONLINE', NOW())
 		ON DUPLICATE KEY UPDATE
 			endpoint = VALUES(endpoint),
+			callback_url = VALUES(callback_url),
 			status = 'ONLINE',
 			last_heartbeat = NOW()
 	`
-	_, err := s.db.Exec(query, agentID, endpoint)
+	_, err := s.db.Exec(query, agentID, endpoint, callbackURL)
 	return err
 }
 
@@ -89,11 +105,11 @@ func (s *Storage) UpdateHeartbeat(agentID string) error {
 
 // GetAgent 获取 Agent 信息
 func (s *Storage) GetAgent(agentID string) (*Agent, error) {
-	query := `SELECT id, agent_id, endpoint, status, last_heartbeat, created_at FROM agents WHERE agent_id = ?`
+	query := `SELECT id, agent_id, endpoint, COALESCE(callback_url, ''), status, last_heartbeat, created_at FROM agents WHERE agent_id = ?`
 	row := s.db.QueryRow(query, agentID)
 
 	var a Agent
-	err := row.Scan(&a.ID, &a.AgentID, &a.Endpoint, &a.Status, &a.LastHeartbeat, &a.CreatedAt)
+	err := row.Scan(&a.ID, &a.AgentID, &a.Endpoint, &a.CallbackURL, &a.Status, &a.LastHeartbeat, &a.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -101,6 +117,26 @@ func (s *Storage) GetAgent(agentID string) (*Agent, error) {
 		return nil, err
 	}
 	return &a, nil
+}
+
+// ListAgents 获取所有 Agent 列表
+func (s *Storage) ListAgents() ([]Agent, error) {
+	query := `SELECT id, agent_id, endpoint, COALESCE(callback_url, ''), status, last_heartbeat, created_at FROM agents ORDER BY created_at DESC`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var agents []Agent
+	for rows.Next() {
+		var a Agent
+		if err := rows.Scan(&a.ID, &a.AgentID, &a.Endpoint, &a.CallbackURL, &a.Status, &a.LastHeartbeat, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		agents = append(agents, a)
+	}
+	return agents, nil
 }
 
 // CheckOfflineAgents 检查离线 Agent 并更新状态
@@ -174,6 +210,23 @@ func (s *Storage) GetAllRooms() ([]*Room, error) {
 		rooms = append(rooms, &r)
 	}
 	return rooms, rows.Err()
+}
+
+// DeleteRoom 删除聊天室（级联删除 members 表记录）
+func (s *Storage) DeleteRoom(roomID string) error {
+	// 删除聊天室（members 表通过外键级联删除，或手动删除）
+	query := `DELETE FROM rooms WHERE room_id = ?`
+	_, err := s.db.Exec(query, roomID)
+	if err != nil {
+		return err
+	}
+
+	// 从内存缓存中移除成员
+	s.memberMu.Lock()
+	delete(s.members, roomID)
+	s.memberMu.Unlock()
+
+	return nil
 }
 
 // ============ User 操作 ============
@@ -845,6 +898,80 @@ func (s *Storage) createUserRoomSessionsTable() error {
 	`
 	_, err := s.db.Exec(query)
 	return err
+}
+
+// createAgentTemplatesTable 创建 Agent 模板表
+func (s *Storage) createAgentTemplatesTable() error {
+	query := `
+		CREATE TABLE IF NOT EXISTS agent_templates (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			agent_id VARCHAR(64) NOT NULL UNIQUE,
+			soul_json TEXT,
+			bootstrap_json TEXT,
+			meta_json TEXT,
+			updated_at BIGINT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at_datetime DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+			KEY idx_agent_id (agent_id)
+		)
+	`
+	_, err := s.db.Exec(query)
+	return err
+}
+
+// loadTemplatesToMemory 从数据库加载模板到内存
+func (s *Storage) loadTemplatesToMemory() error {
+	query := `SELECT agent_id, soul_json, bootstrap_json, meta_json, updated_at FROM agent_templates`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	s.templateMu.Lock()
+	defer s.templateMu.Unlock()
+
+	for rows.Next() {
+		var agentID string
+		var soulJSON, bootstrapJSON, metaJSON sql.NullString
+		var updatedAt int64
+
+		if err := rows.Scan(&agentID, &soulJSON, &bootstrapJSON, &metaJSON, &updatedAt); err != nil {
+			slog.Error("扫描模板行失败", "error", err)
+			continue
+		}
+
+		template := &AgentTemplate{
+			AgentID:   agentID,
+			UpdatedAt: updatedAt,
+		}
+
+		if soulJSON.Valid && soulJSON.String != "" {
+			var soul Soul
+			if err := json.Unmarshal([]byte(soulJSON.String), &soul); err == nil {
+				template.Soul = &soul
+			}
+		}
+
+		if bootstrapJSON.Valid && bootstrapJSON.String != "" {
+			var bootstrap Bootstrap
+			if err := json.Unmarshal([]byte(bootstrapJSON.String), &bootstrap); err == nil {
+				template.Bootstrap = &bootstrap
+			}
+		}
+
+		if metaJSON.Valid && metaJSON.String != "" {
+			var meta TemplateMeta
+			if err := json.Unmarshal([]byte(metaJSON.String), &meta); err == nil {
+				template.Meta = &meta
+			}
+		}
+
+		s.templates[agentID] = template
+	}
+
+	slog.Info("[Template] 已加载模板到内存", "count", len(s.templates))
+	return nil
 }
 
 // ============ Task 操作 ============
@@ -1643,4 +1770,348 @@ func (s *Storage) GetRoomAgents(roomID string) ([]AgentInfo, error) {
 	}
 
 	return agents, nil
+}
+
+// ============ Agent 模板操作 ============
+
+// GetTemplate 获取 Agent 模板
+func (s *Storage) GetTemplate(agentID string) (*AgentTemplate, error) {
+	s.templateMu.RLock()
+	defer s.templateMu.RUnlock()
+
+	if template, ok := s.templates[agentID]; ok {
+		return template, nil
+	}
+	return nil, nil // 不存在返回 nil
+}
+
+// SaveTemplate 保存 Agent 模板（持久化到MySQL + 更新内存）
+func (s *Storage) SaveTemplate(agentID string, template *AgentTemplate) error {
+	template.AgentID = agentID
+	template.UpdatedAt = time.Now().Unix()
+
+	// 序列化为 JSON
+	soulJSON, _ := json.Marshal(template.Soul)
+	bootstrapJSON, _ := json.Marshal(template.Bootstrap)
+	metaJSON, _ := json.Marshal(template.Meta)
+
+	// 写入 MySQL
+	query := `
+		INSERT INTO agent_templates (agent_id, soul_json, bootstrap_json, meta_json, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			soul_json = VALUES(soul_json),
+			bootstrap_json = VALUES(bootstrap_json),
+			meta_json = VALUES(meta_json),
+			updated_at = VALUES(updated_at)
+	`
+	_, err := s.db.Exec(query, agentID, string(soulJSON), string(bootstrapJSON), string(metaJSON), template.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("保存模板到数据库失败: %w", err)
+	}
+
+	// 更新内存缓存
+	s.templateMu.Lock()
+	s.templates[agentID] = template
+	s.templateMu.Unlock()
+
+	return nil
+}
+
+// DeleteTemplate 删除 Agent 模板（从MySQL删除 + 从内存移除）
+func (s *Storage) DeleteTemplate(agentID string) error {
+	// 从 MySQL 删除
+	query := `DELETE FROM agent_templates WHERE agent_id = ?`
+	_, err := s.db.Exec(query, agentID)
+	if err != nil {
+		return fmt.Errorf("从数据库删除模板失败: %w", err)
+	}
+
+	// 从内存移除
+	s.templateMu.Lock()
+	delete(s.templates, agentID)
+	s.templateMu.Unlock()
+
+	return nil
+}
+
+// ============ Trigger 操作 ============
+
+// CreateTrigger 创建触发器
+func (s *Storage) CreateTrigger(t *Trigger) error {
+	query := `
+		INSERT INTO triggers (id, xclient_id, name, type, config, reason, room_id, room_valid, status, fire_count, cooldown_seconds, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query, t.ID, t.XClientID, t.Name, t.Type, string(t.Config), t.Reason, t.RoomID, t.RoomValid, t.Status, t.FireCount, t.CooldownSeconds, t.CreatedAt, t.UpdatedAt)
+	return err
+}
+
+// GetTrigger 获取单个触发器
+func (s *Storage) GetTrigger(id string) (*Trigger, error) {
+	query := `SELECT id, xclient_id, name, type, config, reason, room_id, room_valid, status, invalid_reason, last_fired_at, fire_count, max_fires, cooldown_seconds, expires_at, created_at, updated_at FROM triggers WHERE id = ?`
+	row := s.db.QueryRow(query, id)
+	return s.scanTrigger(row)
+}
+
+// GetTriggers 获取触发器列表
+func (s *Storage) GetTriggers(roomID, status string) ([]*Trigger, error) {
+	query := `SELECT id, xclient_id, name, type, config, reason, room_id, room_valid, status, invalid_reason, last_fired_at, fire_count, max_fires, cooldown_seconds, expires_at, created_at, updated_at FROM triggers WHERE 1=1`
+	args := []interface{}{}
+
+	if roomID != "" {
+		query += ` AND room_id = ?`
+		args = append(args, roomID)
+	}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var triggers []*Trigger
+	for rows.Next() {
+		t, err := s.scanTriggerRows(rows)
+		if err != nil {
+			continue
+		}
+		triggers = append(triggers, t)
+	}
+	return triggers, rows.Err()
+}
+
+// GetTriggersByXClient 获取 X-Client 的所有触发器
+func (s *Storage) GetTriggersByXClient(xclientID string) ([]*Trigger, error) {
+	query := `SELECT id, xclient_id, name, type, config, reason, room_id, room_valid, status, invalid_reason, last_fired_at, fire_count, max_fires, cooldown_seconds, expires_at, created_at, updated_at FROM triggers WHERE xclient_id = ? ORDER BY created_at DESC`
+	rows, err := s.db.Query(query, xclientID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var triggers []*Trigger
+	for rows.Next() {
+		t, err := s.scanTriggerRows(rows)
+		if err != nil {
+			continue
+		}
+		triggers = append(triggers, t)
+	}
+	return triggers, rows.Err()
+}
+
+// UpdateTrigger 更新触发器
+func (s *Storage) UpdateTrigger(t *Trigger) error {
+	query := `
+		UPDATE triggers SET
+			name = ?, type = ?, config = ?, reason = ?, room_id = ?, room_valid = ?,
+			status = ?, invalid_reason = ?, max_fires = ?, cooldown_seconds = ?, expires_at = ?, updated_at = ?
+		WHERE id = ?
+	`
+	_, err := s.db.Exec(query, t.Name, t.Type, string(t.Config), t.Reason, t.RoomID, t.RoomValid,
+		t.Status, t.InvalidReason, t.MaxFires, t.CooldownSeconds, t.ExpiresAt, t.UpdatedAt, t.ID)
+	return err
+}
+
+// UpdateTriggerFired 更新触发器触发状态
+func (s *Storage) UpdateTriggerFired(id string, firedAt int64) error {
+	query := `UPDATE triggers SET last_fired_at = ?, fire_count = fire_count + 1, updated_at = ? WHERE id = ?`
+	_, err := s.db.Exec(query, firedAt, time.Now().UnixMilli(), id)
+	return err
+}
+
+// InvalidateTrigger 使触发器失效
+func (s *Storage) InvalidateTrigger(id, reason string) error {
+	query := `UPDATE triggers SET status = 'invalid', room_valid = FALSE, invalid_reason = ?, updated_at = ? WHERE id = ?`
+	_, err := s.db.Exec(query, reason, time.Now().UnixMilli(), id)
+	return err
+}
+
+// InvalidateTriggersByRoom 使聊天室关联的所有触发器失效
+func (s *Storage) InvalidateTriggersByRoom(roomID, reason string) error {
+	query := `UPDATE triggers SET status = 'invalid', room_valid = FALSE, invalid_reason = ?, updated_at = ? WHERE room_id = ?`
+	_, err := s.db.Exec(query, reason, time.Now().UnixMilli(), roomID)
+	return err
+}
+
+// DeleteTrigger 删除触发器
+func (s *Storage) DeleteTrigger(id string) error {
+	query := `DELETE FROM triggers WHERE id = ?`
+	_, err := s.db.Exec(query, id)
+	return err
+}
+
+// scanTrigger 扫描单行触发器
+func (s *Storage) scanTrigger(row *sql.Row) (*Trigger, error) {
+	var t Trigger
+	var config, reason, invalidReason sql.NullString
+	var lastFiredAt, expiresAt sql.NullInt64
+	var maxFires, cooldownSeconds sql.NullInt64
+
+	err := row.Scan(&t.ID, &t.XClientID, &t.Name, &t.Type, &config, &reason, &t.RoomID, &t.RoomValid,
+		&t.Status, &invalidReason, &lastFiredAt, &t.FireCount, &maxFires, &cooldownSeconds, &expiresAt,
+		&t.CreatedAt, &t.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if config.Valid {
+		t.Config = json.RawMessage(config.String)
+	}
+	if reason.Valid {
+		t.Reason = reason.String
+	}
+	if invalidReason.Valid {
+		t.InvalidReason = invalidReason.String
+	}
+	if lastFiredAt.Valid {
+		t.LastFiredAt = lastFiredAt.Int64
+	}
+	if maxFires.Valid {
+		maxFiresInt := int(maxFires.Int64)
+		t.MaxFires = &maxFiresInt
+	}
+	if cooldownSeconds.Valid {
+		t.CooldownSeconds = int(cooldownSeconds.Int64)
+	}
+	if expiresAt.Valid {
+		t.ExpiresAt = &expiresAt.Int64
+	}
+
+	return &t, nil
+}
+
+// scanTriggerRows 扫描多行触发器
+func (s *Storage) scanTriggerRows(rows *sql.Rows) (*Trigger, error) {
+	var t Trigger
+	var config, reason, invalidReason sql.NullString
+	var lastFiredAt, expiresAt sql.NullInt64
+	var maxFires, cooldownSeconds sql.NullInt64
+
+	err := rows.Scan(&t.ID, &t.XClientID, &t.Name, &t.Type, &config, &reason, &t.RoomID, &t.RoomValid,
+		&t.Status, &invalidReason, &lastFiredAt, &t.FireCount, &maxFires, &cooldownSeconds, &expiresAt,
+		&t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	if config.Valid {
+		t.Config = json.RawMessage(config.String)
+	}
+	if reason.Valid {
+		t.Reason = reason.String
+	}
+	if invalidReason.Valid {
+		t.InvalidReason = invalidReason.String
+	}
+	if lastFiredAt.Valid {
+		t.LastFiredAt = lastFiredAt.Int64
+	}
+	if maxFires.Valid {
+		maxFiresInt := int(maxFires.Int64)
+		t.MaxFires = &maxFiresInt
+	}
+	if cooldownSeconds.Valid {
+		t.CooldownSeconds = int(cooldownSeconds.Int64)
+	}
+	if expiresAt.Valid {
+		t.ExpiresAt = &expiresAt.Int64
+	}
+
+	return &t, nil
+}
+
+// CreateTriggerExecution 创建触发器执行记录
+func (s *Storage) CreateTriggerExecution(ex *TriggerExecution) error {
+	query := `
+		INSERT INTO trigger_executions (id, trigger_id, fired_at, status, error_message, execution_time_ms, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.Exec(query, ex.ID, ex.TriggerID, ex.FiredAt, ex.Status, ex.ErrorMessage, ex.ExecutionTimeMs, ex.CreatedAt)
+	return err
+}
+
+// UpdateTriggerExecution 更新触发器执行记录
+func (s *Storage) UpdateTriggerExecution(id, status, errorMessage string, executionTimeMs int) error {
+	query := `UPDATE trigger_executions SET status = ?, error_message = ?, execution_time_ms = ? WHERE id = ?`
+	_, err := s.db.Exec(query, status, errorMessage, executionTimeMs, id)
+	return err
+}
+
+// GetTriggerExecutions 获取触发器的执行记录
+func (s *Storage) GetTriggerExecutions(triggerID string, limit int) ([]*TriggerExecution, error) {
+	query := `SELECT id, trigger_id, fired_at, status, error_message, execution_time_ms, created_at FROM trigger_executions WHERE trigger_id = ? ORDER BY fired_at DESC LIMIT ?`
+	rows, err := s.db.Query(query, triggerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var execs []*TriggerExecution
+	for rows.Next() {
+		var ex TriggerExecution
+		var errorMsg sql.NullString
+		var execTimeMs sql.NullInt64
+		if err := rows.Scan(&ex.ID, &ex.TriggerID, &ex.FiredAt, &ex.Status, &errorMsg, &execTimeMs, &ex.CreatedAt); err != nil {
+			continue
+		}
+		if errorMsg.Valid {
+			ex.ErrorMessage = errorMsg.String
+		}
+		if execTimeMs.Valid {
+			ex.ExecutionTimeMs = int(execTimeMs.Int64)
+		}
+		execs = append(execs, &ex)
+	}
+	return execs, rows.Err()
+}
+
+// ============ Poll State 操作 ============
+
+// GetPollState 获取轮询状态
+func (s *Storage) GetPollState(triggerID string) (*PollState, error) {
+	query := `SELECT trigger_id, last_value, last_checked_at FROM poll_states WHERE trigger_id = ?`
+	row := s.db.QueryRow(query, triggerID)
+
+	var ps PollState
+	var lastValue sql.NullString
+	err := row.Scan(&ps.TriggerID, &lastValue, &ps.LastCheckedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastValue.Valid {
+		ps.LastValue = lastValue.String
+	}
+	return &ps, nil
+}
+
+// UpsertPollState 更新或创建轮询状态
+func (s *Storage) UpsertPollState(ps *PollState) error {
+	query := `
+		INSERT INTO poll_states (trigger_id, last_value, last_checked_at)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE last_value = VALUES(last_value), last_checked_at = VALUES(last_checked_at)
+	`
+	_, err := s.db.Exec(query, ps.TriggerID, ps.LastValue, ps.LastCheckedAt)
+	return err
+}
+
+// DeletePollState 删除轮询状态
+func (s *Storage) DeletePollState(triggerID string) error {
+	query := `DELETE FROM poll_states WHERE trigger_id = ?`
+	_, err := s.db.Exec(query, triggerID)
+	return err
 }

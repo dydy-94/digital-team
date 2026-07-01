@@ -24,6 +24,17 @@ type Config struct {
 	// 上下文管理
 	MaxMemorySize  int `json:"max_memory_size"`  // 最大消息数
 	MaxMemoryChars int `json:"max_memory_chars"` // 最大字符数
+
+	// Agent 模板配置
+	Template TemplateConfig `json:"template"`
+}
+
+// TemplateConfig 模板配置
+type TemplateConfig struct {
+	Enabled  bool   `json:"enabled"`             // 是否启用模板
+	Source   string `json:"source"`              // 模板来源: "coordinator" (默认) 或 "file"
+	FileDir  string `json:"file_dir,omitempty"`  // 当 source="file" 时使用的本地目录
+	SoulMode string `json:"soul_mode,omitempty"` // Soul注入模式: "always" (默认) 或 "once"
 }
 
 var configPath string
@@ -83,6 +94,18 @@ func LoadConfig() (*Config, error) {
 	}
 	if cfg.PollBatchSize <= 0 {
 		cfg.PollBatchSize = 50
+	}
+
+	// 模板默认值
+	if cfg.Template.Source == "" {
+		cfg.Template.Source = "coordinator" // 默认从 Coordinator 获取
+	}
+	if cfg.Template.Source == "file" && cfg.Template.FileDir == "" {
+		homeDir, _ := os.UserHomeDir()
+		cfg.Template.FileDir = fmt.Sprintf("%s/.x-client/templates/%s", homeDir, cfg.AgentID)
+	}
+	if cfg.Template.SoulMode == "" {
+		cfg.Template.SoulMode = "always" // 默认每次对话都注入Soul Context
 	}
 
 	return cfg, nil

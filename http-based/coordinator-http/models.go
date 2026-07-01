@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // ============ 数据库模型 ============
 
@@ -9,6 +12,7 @@ type Agent struct {
 	ID            int64     `json:"-" db:"id"`
 	AgentID       string    `json:"agent_id" db:"agent_id"`
 	Endpoint      string    `json:"endpoint" db:"endpoint"`
+	CallbackURL   string    `json:"callback_url,omitempty" db:"callback_url"` // A2A 回调 URL
 	Status        string    `json:"status" db:"status"`
 	LastHeartbeat time.Time `json:"last_heartbeat" db:"last_heartbeat"`
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`
@@ -84,8 +88,9 @@ type MessageDelivery struct {
 
 // RegisterRequest Agent 注册请求
 type RegisterRequest struct {
-	AgentID  string `json:"agent_id" binding:"required"`
-	Endpoint string `json:"endpoint" binding:"required"`
+	AgentID     string `json:"agent_id" binding:"required"`
+	Endpoint    string `json:"endpoint" binding:"required"`
+	CallbackURL string `json:"callback_url,omitempty"` // A2A 回调 URL，可选
 }
 
 // RegisterResponse 注册响应
@@ -411,4 +416,162 @@ type UpsertRoomConfigRequest struct {
 	HierarchyEnabled bool   `json:"hierarchy_enabled"`
 	AutoWelcome      bool   `json:"auto_welcome"`
 	WelcomeMessage   string `json:"welcome_message"`
+}
+
+// ============ Agent 模板 API 请求/响应模型 ============
+
+// Soul Identity 部分
+type SoulIdentity struct {
+	Role      string `json:"role"`
+	Expertise string `json:"expertise,omitempty"`
+	Creator   string `json:"creator,omitempty"`
+}
+
+// Soul Agent 人格定义
+type Soul struct {
+	Identity    SoulIdentity `json:"identity"`
+	Personality []string     `json:"personality"`
+	WorkStyle   []string     `json:"work_style"`
+	Boundaries  []string     `json:"boundaries"`
+}
+
+// Bootstrap 对话流程模板
+type Bootstrap struct {
+	GreetingTemplate    string   `json:"greeting_template"`
+	DeliverableTemplate string   `json:"deliverable_template"`
+	Capabilities        []string `json:"capabilities"`
+	ExitPrompt          string   `json:"exit_prompt"`
+}
+
+// TemplateMeta 模板元数据
+type TemplateMeta struct {
+	Name           string            `json:"name"`
+	Description    string            `json:"description"`
+	Icon           string            `json:"icon"`
+	Category       string            `json:"category"`
+	Capabilities   []string          `json:"capabilities"`
+	AutonomyPolicy map[string]string `json:"autonomy_policy"`
+}
+
+// AgentTemplate Agent 模板
+type AgentTemplate struct {
+	AgentID   string        `json:"agent_id"`
+	Soul      *Soul         `json:"soul,omitempty"`
+	Bootstrap *Bootstrap    `json:"bootstrap,omitempty"`
+	Meta      *TemplateMeta `json:"meta,omitempty"`
+	UpdatedAt int64         `json:"updated_at"`
+}
+
+// GetTemplateResponse 获取模板响应
+type GetTemplateResponse struct {
+	Success  bool           `json:"success"`
+	Template *AgentTemplate `json:"template,omitempty"`
+	Error    string         `json:"error,omitempty"`
+}
+
+// UpdateTemplateRequest 更新模板请求
+type UpdateTemplateRequest struct {
+	Soul      *Soul         `json:"soul,omitempty"`
+	Bootstrap *Bootstrap    `json:"bootstrap,omitempty"`
+	Meta      *TemplateMeta `json:"meta,omitempty"`
+}
+
+// ============ Trigger 触发器模型 ============
+
+// Trigger 触发器
+type Trigger struct {
+	ID              string          `json:"id"`
+	XClientID       string          `json:"xclient_id"`
+	Name            string          `json:"name"`
+	Type            string          `json:"type"` // cron|once|interval|poll|webhook|on_message
+	Config          json.RawMessage `json:"config"`
+	Reason          string          `json:"reason"`
+	RoomID          string          `json:"room_id"`
+	RoomValid       bool            `json:"room_valid"`
+	Status          string          `json:"status"` // enabled|disabled|invalid|expired
+	InvalidReason   string          `json:"invalid_reason,omitempty"`
+	LastFiredAt     int64           `json:"last_fired_at,omitempty"`
+	FireCount       int             `json:"fire_count"`
+	MaxFires        *int            `json:"max_fires,omitempty"`
+	CooldownSeconds int             `json:"cooldown_seconds"`
+	ExpiresAt       *int64          `json:"expires_at,omitempty"`
+	CreatedAt       int64           `json:"created_at"`
+	UpdatedAt       int64           `json:"updated_at"`
+}
+
+// TriggerExecution 触发器执行记录
+type TriggerExecution struct {
+	ID              string `json:"id"`
+	TriggerID       string `json:"trigger_id"`
+	FiredAt         int64  `json:"fired_at"`
+	Status          string `json:"status"` // pending|success|failed|skipped
+	ErrorMessage    string `json:"error_message,omitempty"`
+	ExecutionTimeMs int    `json:"execution_time_ms"`
+	CreatedAt       int64  `json:"created_at"`
+}
+
+// PollState 轮询状态
+type PollState struct {
+	TriggerID     string `json:"trigger_id"`
+	LastValue     string `json:"last_value"`
+	LastCheckedAt int64  `json:"last_checked_at"`
+}
+
+// ============ Trigger API 请求/响应模型 ============
+
+// CreateTriggerRequest 创建触发器请求
+type CreateTriggerRequest struct {
+	Name            string          `json:"name" binding:"required"`
+	Type            string          `json:"type" binding:"required"`
+	Config          json.RawMessage `json:"config" binding:"required"`
+	Reason          string          `json:"reason"`
+	RoomID          string          `json:"room_id" binding:"required"`
+	XClientID       string          `json:"xclient_id" binding:"required"`
+	XClientEndpoint string          `json:"xclient_endpoint"`
+	MaxFires        *int            `json:"max_fires"`
+	CooldownSeconds int             `json:"cooldown_seconds"`
+}
+
+// UpdateTriggerRequest 更新触发器请求
+type UpdateTriggerRequest struct {
+	Name            *string          `json:"name,omitempty"`
+	Config          *json.RawMessage `json:"config,omitempty"`
+	Reason          *string          `json:"reason,omitempty"`
+	RoomID          *string          `json:"room_id,omitempty"`
+	IsEnabled       *bool            `json:"is_enabled,omitempty"`
+	MaxFires        *int             `json:"max_fires,omitempty"`
+	CooldownSeconds *int             `json:"cooldown_seconds,omitempty"`
+}
+
+// TriggerNotifyRequest 触发器触发通知请求
+type TriggerNotifyRequest struct {
+	TriggerID   string                 `json:"trigger_id" binding:"required"`
+	XClientID   string                 `json:"xclient_id" binding:"required"`
+	TriggerType string                 `json:"trigger_type" binding:"required"`
+	Reason      string                 `json:"reason"`
+	Payload     map[string]interface{} `json:"payload,omitempty"`
+}
+
+// TriggerResponse 触发器响应
+type TriggerResponse struct {
+	Success    bool   `json:"success"`
+	TriggerID  string `json:"trigger_id,omitempty"`
+	NextFireAt int64  `json:"next_fire_at,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// TriggerListResponse 触发器列表响应
+type TriggerListResponse struct {
+	Success  bool       `json:"success"`
+	Triggers []*Trigger `json:"triggers"`
+}
+
+// TriggerInvalidateRequest 使触发器失效请求
+type TriggerInvalidateRequest struct {
+	Reason string `json:"reason"`
+}
+
+// RoomDeletedRequest 聊天室删除通知请求
+type RoomDeletedRequest struct {
+	RoomID string `json:"room_id" binding:"required"`
 }

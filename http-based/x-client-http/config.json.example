@@ -8,5 +8,11 @@
   "poll_batch_size": 50,
   "heartbeat_interval": 30,
   "max_memory_size": 50,
-  "max_memory_chars": 2000
+  "max_memory_chars": 2000,
+  "template": {
+    "enabled": true,
+    "source": "coordinator",
+    "file_dir": "~/.x-client/templates/agent_1",
+    "soul_mode": "always"
+  }
 }

@@ -41,6 +41,15 @@ type XClient struct {
 	permissionCache  *PermissionCache
 	workspaceManager *WorkspaceManager
 
+	// 模板系统
+	templateLoader  *FileSystemTemplateLoader
+	bootstrapEngine *BootstrapEngine
+	sessionTurnsMgr *SessionTurnsManager
+	templateEnabled bool
+
+	// 触发器系统
+	triggerRuntime *TriggerRuntime
+
 	// 已加入的聊天室
 	joinedRooms map[string]bool
 	roomsMu     sync.RWMutex
@@ -59,7 +68,7 @@ func NewXClient(cfg *Config) *XClient {
 		}
 	}
 
-	return &XClient{
+	x := &XClient{
 		agentID:        cfg.AgentID,
 		coordinatorURL: cfg.CoordinatorURL,
 		agentCoreURL:   cfg.AgentCoreURL,
@@ -77,7 +86,59 @@ func NewXClient(cfg *Config) *XClient {
 		},
 		permissionCache:  NewPermissionCache(cfg.CoordinatorURL),
 		workspaceManager: NewWorkspaceManager(cfg.CoordinatorURL, cfg.AgentID, ""),
+		sessionTurnsMgr:  NewSessionTurnsManager(),
+		templateEnabled:  cfg.Template.Enabled,
 	}
+
+	// 初始化模板系统
+	if cfg.Template.Enabled {
+		var template *AgentTemplate
+		var err error
+
+		switch cfg.Template.Source {
+		case "coordinator":
+			// 从 Coordinator API 获取模板
+			loader := NewCoordinatorTemplateLoader(cfg.AgentID, cfg.CoordinatorURL)
+			template, err = loader.GetTemplate()
+			if err != nil {
+				log.Printf("[WARN] [%s] 从 Coordinator 获取模板失败: %v", cfg.AgentID, err)
+			} else if template == nil {
+				log.Printf("[INFO] [%s] Coordinator 中无模板配置", cfg.AgentID)
+			} else {
+				log.Printf("[INFO] [%s] 从 Coordinator 加载模板成功", cfg.AgentID)
+			}
+
+		case "file":
+			// 从本地文件加载模板
+			if err := EnsureTemplateDir(cfg.Template.FileDir); err != nil {
+				log.Printf("[WARN] [%s] 创建模板目录失败: %v", cfg.AgentID, err)
+			} else {
+				loader := NewFileSystemTemplateLoader(cfg.Template.FileDir, cfg.AgentID)
+				template, err = loader.LoadTemplate()
+				if err != nil {
+					log.Printf("[WARN] [%s] 加载本地模板失败: %v", cfg.AgentID, err)
+				} else if template != nil {
+					log.Printf("[INFO] [%s] 本地模板加载成功: %s", cfg.AgentID, cfg.Template.FileDir)
+				}
+			}
+
+		default:
+			log.Printf("[WARN] [%s] 未知的模板来源: %s", cfg.AgentID, cfg.Template.Source)
+		}
+
+		if template != nil {
+			x.bootstrapEngine = NewBootstrapEngine(cfg.AgentID, template, cfg.Template.SoulMode)
+			if template.Meta != nil {
+				log.Printf("[INFO] [%s] Agent Name: %s, Soul Mode: %s", cfg.AgentID, template.Meta.Name, cfg.Template.SoulMode)
+			}
+		}
+	}
+
+	// 初始化触发器系统
+	coordinatorClient := NewCoordinatorClient(cfg.CoordinatorURL, cfg.AgentID)
+	x.triggerRuntime = NewTriggerRuntime(cfg.AgentID, endpoint, coordinatorClient)
+
+	return x
 }
 
 func (x *XClient) getMemoryWindow(roomID string) *MemoryWindow {
@@ -121,8 +182,9 @@ func (x *XClient) isMessageProcessed(msgId string) bool {
 
 func (x *XClient) register() error {
 	req := RegisterRequest{
-		AgentID:  x.agentID,
-		Endpoint: x.endpoint,
+		AgentID:     x.agentID,
+		Endpoint:    x.endpoint,
+		CallbackURL: x.endpoint + "/api/callback",
 	}
 	jsonData, _ := json.Marshal(req)
 
@@ -257,6 +319,18 @@ func (x *XClient) handleMessage(msg *PollMessage) {
 
 	// 被 @ 了，需要处理
 	log.Printf("[INFO] [%s] [唤醒] 被 @ 消息，需要处理", x.agentID)
+
+	// 增加用户消息计数
+	turns := x.sessionTurnsMgr.Increment(msg.RoomID, msg.SenderID)
+
+	// 模板系统：首次接触时发送 greeting
+	if x.templateEnabled && x.bootstrapEngine != nil && turns <= 1 {
+		ctx := x.bootstrapEngine.BuildContext(msg.RoomID, msg.SenderID, msg.SenderID)
+		greeting := x.bootstrapEngine.RenderGreeting(ctx)
+		if greeting != "" {
+			x.sendTemplateReply(msg, greeting)
+		}
+	}
 
 	// 特殊命令检测（在 Intent 路由之前）
 	content := strings.TrimSpace(msg.Content)
@@ -688,6 +762,20 @@ func (x *XClient) wakeupAgentCore(msg *PollMessage, memoryWin *MemoryWindow) {
 	// 确保工作目录存在
 	x.workspaceManager.EnsureWorkspaceDirForRoom(msg.RoomID)
 
+	// 模板系统：注入 Soul Context
+	if x.templateEnabled && x.bootstrapEngine != nil {
+		shouldInject := x.bootstrapEngine.ShouldInjectSoul(msg.RoomID, msg.SenderID)
+		if shouldInject {
+			soulCtx := x.bootstrapEngine.BuildSoulContext()
+			if soulCtx != "" {
+				contextPrompt = soulCtx + "\n\n## Recent Conversation\n" + contextPrompt
+				log.Printf("[DEBUG] [%s] [Soul] 已注入 Soul Context 到对话 (mode: %s)", x.agentID, x.bootstrapEngine.soulMode)
+			}
+			// 标记已注入（用于once模式）
+			x.bootstrapEngine.MarkSoulInjected(msg.RoomID, msg.SenderID)
+		}
+	}
+
 	// 构建请求
 	reqBody := map[string]string{
 		"message":    contextPrompt,
@@ -784,6 +872,37 @@ func (x *XClient) sendReply(originalMsg *PollMessage, content string) {
 	}
 }
 
+// sendTemplateReply 发送模板回复（用于greeting等）
+func (x *XClient) sendTemplateReply(originalMsg *PollMessage, content string) {
+	req := SendMessageRequest{
+		RoomID:       originalMsg.RoomID,
+		SenderID:     x.agentID,
+		SenderType:   "agent",
+		Content:      content,
+		TargetID:     "ALL",
+		MentionUsers: []string{},
+		Intent:       "RESPONSE",
+		ReplyToMsgID: originalMsg.MsgID,
+	}
+	jsonData, _ := json.Marshal(req)
+
+	log.Printf("[DEBUG] [%s] 发送模板回复请求: %s", x.agentID, string(jsonData))
+
+	resp, err := x.httpClient.Post(
+		x.coordinatorURL+"/api/message",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+	if err != nil {
+		log.Printf("[ERROR] [%s] 发送模板回复失败: %v", x.agentID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	log.Printf("[DEBUG] [%s] 收到响应: 状态码=%d, 响应内容=%s", x.agentID, resp.StatusCode, string(bodyBytes))
+}
+
 // ============ HTTP 服务 ============
 
 func (x *XClient) startHTTPServer() {
@@ -815,6 +934,15 @@ func (x *XClient) startHTTPServer() {
 		log.Printf("[DEBUG] test static route matched")
 		w.Write([]byte("test static ok"))
 	})
+
+	// 触发器接口
+	mux.HandleFunc("/api/trigger/register", x.handleTriggerRegister)
+	mux.HandleFunc("/api/trigger/list", x.handleTriggerList)
+	mux.HandleFunc("/api/trigger/", x.handleTriggerUpdate) // PUT /api/trigger/{id}
+	mux.HandleFunc("/api/trigger/room-deleted", x.handleRoomDeleted)
+
+	// A2A 回调接口
+	mux.HandleFunc("/api/callback", x.handleA2ACallback)
 
 	x.httpServer = &http.Server{
 		Addr:    x.listenAddr,
@@ -995,6 +1123,13 @@ func (x *XClient) Start() error {
 	// 启动心跳
 	go x.heartbeatLoop()
 
+	// 启动触发器运行时
+	if err := x.triggerRuntime.Start(context.Background()); err != nil {
+		log.Printf("[WARN] [%s] 启动触发器运行时失败: %v", x.agentID, err)
+	} else {
+		log.Printf("[INFO] [%s] 触发器运行时启动成功", x.agentID)
+	}
+
 	log.Printf("[INFO] [%s] x-client 启动成功", x.agentID)
 	return nil
 }
@@ -1012,6 +1147,11 @@ func (x *XClient) heartbeatLoop() {
 
 func (x *XClient) Shutdown() {
 	log.Printf("[INFO] [%s] 开始关闭...", x.agentID)
+
+	// 停止触发器运行时
+	if x.triggerRuntime != nil {
+		x.triggerRuntime.Stop()
+	}
 
 	if x.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1451,6 +1591,178 @@ func (x *XClient) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", transfer.FileName))
 	w.Write(data)
+}
+
+// ============ 触发器 Handler ============
+
+// handleTriggerRegister 处理创建触发器请求
+func (x *XClient) handleTriggerRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CreateTriggerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[INFO] [%s] [触发器] 创建触发器: name=%s, type=%s, room_id=%s", x.agentID, req.Name, req.Type, req.RoomID)
+
+	trigger, err := x.triggerRuntime.CreateTrigger(&req)
+	if err != nil {
+		log.Printf("[ERROR] [%s] [触发器] 创建失败: %v", x.agentID, err)
+		http.Error(w, "创建触发器失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":    true,
+		"trigger_id": trigger.ID,
+		"status":     trigger.Status,
+	})
+}
+
+// handleTriggerList 处理获取触发器列表请求
+func (x *XClient) handleTriggerList(w http.ResponseWriter, r *http.Request) {
+	triggers := x.triggerRuntime.ListTriggers()
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"triggers": triggers,
+	})
+}
+
+// handleTriggerUpdate 处理更新/删除触发器请求
+func (x *XClient) handleTriggerUpdate(w http.ResponseWriter, r *http.Request) {
+	// 从 URL 提取 trigger_id
+	// 格式: /api/trigger/{id}
+	path := strings.TrimPrefix(r.URL.Path, "/api/trigger/")
+	if path == "" {
+		http.Error(w, "Missing trigger ID", http.StatusBadRequest)
+		return
+	}
+
+	triggerID := path
+
+	switch r.Method {
+	case http.MethodPut:
+		var req UpdateTriggerRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("[INFO] [%s] [触发器] 更新触发器: id=%s", x.agentID, triggerID)
+
+		if err := x.triggerRuntime.UpdateTrigger(triggerID, &req); err != nil {
+			log.Printf("[ERROR] [%s] [触发器] 更新失败: %v", x.agentID, err)
+			http.Error(w, "更新触发器失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+
+	case http.MethodDelete:
+		log.Printf("[INFO] [%s] [触发器] 删除触发器: id=%s", x.agentID, triggerID)
+
+		if err := x.triggerRuntime.DeleteTrigger(triggerID); err != nil {
+			log.Printf("[ERROR] [%s] [触发器] 删除失败: %v", x.agentID, err)
+			http.Error(w, "删除触发器失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRoomDeleted 处理聊天室删除通知
+func (x *XClient) handleRoomDeleted(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RoomDeletedRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[INFO] [%s] [触发器] 收到聊天室删除通知: room_id=%s", x.agentID, req.RoomID)
+
+	// 使该聊天室关联的触发器失效
+	x.triggerRuntime.InvalidateTriggersByRoom(req.RoomID)
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// handleA2ACallback 处理 A2A 回调（主动接收其他 Agent 的消息）
+func (x *XClient) handleA2ACallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req A2ACallbackRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[INFO] [%s] [A2A] 收到回调: from=%s, room=%s, msg_id=%s, intent=%s",
+		x.agentID, req.FromAgent, req.RoomID, req.MsgID, req.Intent)
+
+	// 将消息放入处理队列，Agent 会立即处理
+	// 这里模拟一个同步处理，实际可以让 AgentCore 立即响应
+	go func() {
+		x.processA2AMessage(&req)
+	}()
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// processA2AMessage 处理 A2A 消息
+func (x *XClient) processA2AMessage(req *A2ACallbackRequest) {
+	// 调用 AgentCore 处理消息
+	if x.agentCoreURL != "" {
+		// 向 AgentCore 发送消息
+		payload := map[string]interface{}{
+			"room_id":   req.RoomID,
+			"sender_id": req.FromAgent,
+			"content":   req.Content,
+			"intent":    req.Intent,
+			"source":    "a2a_callback",
+		}
+		body, _ := json.Marshal(payload)
+		resp, err := http.Post(x.agentCoreURL+"/process", "application/json", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[WARN] [%s] [A2A] 通知 AgentCore 失败: %v", x.agentID, err)
+		} else {
+			resp.Body.Close()
+			log.Printf("[INFO] [%s] [A2A] 消息已交给 AgentCore 处理", x.agentID)
+		}
+	}
+}
+
+// A2ACallbackRequest A2A 回调请求
+type A2ACallbackRequest struct {
+	Type      string `json:"type"`
+	FromAgent string `json:"from_agent"`
+	RoomID    string `json:"room_id"`
+	MsgID     string `json:"msg_id"`
+	Content   string `json:"content"`
+	Intent    string `json:"intent"`
 }
 
 // ============ 辅助函数 ============

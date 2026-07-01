@@ -56,6 +56,7 @@ func main() {
 	// ============ Agent HTTP API ============
 	router.HandleFunc("/api/agent/register", h.RegisterHandler).Methods("POST")
 	router.HandleFunc("/api/agent/heartbeat", h.HeartbeatHandler).Methods("POST")
+	router.HandleFunc("/api/agents", h.ListAgentsHandler).Methods("GET")
 	router.HandleFunc("/api/poll", h.PollHandler).Methods("GET")
 	router.HandleFunc("/api/message", h.SendMessageHandler).Methods("POST")
 
@@ -66,6 +67,7 @@ func main() {
 
 	// ============ Room API ============
 	router.HandleFunc("/api/rooms", h.GetRoomsHandler).Methods("GET")
+	router.HandleFunc("/api/room/{room_id}", h.GetRoomHandler).Methods("GET")
 	router.HandleFunc("/api/room/create", h.CreateRoomHandler).Methods("POST")
 	router.HandleFunc("/api/room/join", h.JoinRoomHandler).Methods("POST")
 	router.HandleFunc("/api/room/leave", h.LeaveRoomPOSTHandler).Methods("POST")             // POST 方法
@@ -73,6 +75,7 @@ func main() {
 	router.HandleFunc("/api/room/members", h.GetRoomMembersByQueryHandler).Methods("GET")    // 查询参数版本
 	router.HandleFunc("/api/room/{room_id}/members", h.GetRoomMembersHandler).Methods("GET") // 路径参数版本
 	router.HandleFunc("/api/room/{room_id}/leave/{member_id}", h.LeaveRoomHandler).Methods("DELETE")
+	router.HandleFunc("/api/room/{room_id}", h.DeleteRoomHandler).Methods("DELETE")
 
 	// ============ Task API ============
 	router.HandleFunc("/api/task/create", h.CreateTaskHandler).Methods("POST")
@@ -109,6 +112,22 @@ func main() {
 	router.HandleFunc("/api/agent/context", h.GetAgentContextHandler).Methods("GET")
 	router.HandleFunc("/api/room/{room_id}/agents", h.GetRoomAgentsHandler).Methods("GET")
 	router.HandleFunc("/api/room/{room_id}/config", h.UpdateRoomConfigHandler).Methods("PUT")
+
+	// ============ Agent 模板 API ============
+	router.HandleFunc("/api/agent/{agent_id}/template", h.GetTemplateHandler).Methods("GET")
+	router.HandleFunc("/api/agent/{agent_id}/template", h.UpdateTemplateHandler).Methods("PUT")
+	router.HandleFunc("/api/agent/{agent_id}/template", h.DeleteTemplateHandler).Methods("DELETE")
+
+	// ============ Trigger 触发器 API ============
+	router.HandleFunc("/api/trigger", h.CreateTriggerHandler).Methods("POST")                       // 创建触发器
+	router.HandleFunc("/api/triggers", h.ListTriggersHandler).Methods("GET")                        // 获取触发器列表
+	router.HandleFunc("/api/trigger/{id}", h.GetTriggerHandler).Methods("GET")                      // 获取触发器详情
+	router.HandleFunc("/api/trigger/{id}", h.UpdateTriggerHandler).Methods("PUT")                   // 更新触发器
+	router.HandleFunc("/api/trigger/{id}", h.DeleteTriggerHandler).Methods("DELETE")                // 删除触发器
+	router.HandleFunc("/api/trigger/{id}/executions", h.GetTriggerExecutionsHandler).Methods("GET") // 获取执行记录
+	router.HandleFunc("/api/trigger/{id}/invalidate", h.InvalidateTriggerHandler).Methods("POST")   // 使触发器失效
+	router.HandleFunc("/api/trigger/notify", h.TriggerNotifyHandler).Methods("POST")                // 触发器触发通知
+	router.HandleFunc("/api/room/deleted", h.RoomDeletedHandler).Methods("POST")                    // 聊天室删除通知
 
 	// ============ User WebSocket ============
 	router.HandleFunc("/ws/user", h.UserWSHandler)
